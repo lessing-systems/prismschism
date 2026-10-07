@@ -52,7 +52,11 @@ You can list several proxies. Give each its own `name` and, if it uses a differe
 docker compose up -d --build
 ```
 
-Open <http://localhost:5173>. Data starts appearing after the first scrape (about 15 seconds); charts fill in as history accumulates.
+Open <http://localhost:5173>.
+
+- Your back-end deployments show up within about 15 seconds (the first scrape), because they are read from LiteLLM's model list. They sit at zero until they serve traffic.
+- Front-end model cards and the token/s figures only appear once a model has actually been used. LiteLLM doesn't export metrics for a model until it handles a request, and Prismschism records changes between scrapes, so a request shows up one scrape (about 15 seconds) after it happens. If the dashboard looks empty, send a request through your proxy.
+- Charts fill in as history accumulates.
 
 ### 4. Adjust docker-compose.yml (optional)
 
