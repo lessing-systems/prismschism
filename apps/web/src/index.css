@@ -1,0 +1,318 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Theme tokens. One [data-theme="<scheme>"] block per scheme (ids in
+ * theme/schemes.ts). Values are bare HSL triplets consumed as hsl(var(--x)).
+ *
+ * Surface ladder (darkest -> lightest):
+ *   --background  page canvas
+ *   --muted       inset wells (chart plots, skeletons, stat tiles)
+ *   --card        primary raised surface
+ *   --popover     elevated surface (tooltips, menus, hover)
+ *   --border      hairlines between surfaces
+ *
+ * --primary is the chrome fill for selected controls; --brand is the loud
+ * highlight. Traffic-light tokens (--healthy/--prefill/--error/--idle/
+ * --disabled) are binding and identical across schemes; tokens.test.ts
+ * guards them, the --legend-N scale and the frozen --chart-1.
+ *
+ * Never nest braces inside a scheme block — tokens.test.ts reads each block up
+ * to its first closing brace.
+ */
+@layer base {
+  :root,
+  [data-theme="deep-ocean"] {
+    --background: 204 78% 8.5%;
+    --foreground: 202 45.5% 84.9%;
+    --card: 203 74% 13%;
+    --card-foreground: 202 45.5% 84.9%;
+    --popover: 203 62% 18%;
+    --popover-foreground: 202 45.5% 90%;
+    --primary: 203 92.2% 25.1%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 203 62% 18%;
+    --secondary-foreground: 202 45.5% 84.9%;
+    --muted: 204 76% 10.5%;
+    --muted-foreground: 203 38% 63%;
+    --accent: 203 62% 18%;
+    --accent-foreground: 202 45.5% 90%;
+    --destructive: 4 82.9% 65.7%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 203 52% 20%;
+    --input: 203 52% 20%;
+    --ring: 203 92.2% 50%;
+    --radius: 0.75rem;
+    --brand: 203 92.2% 50%;
+    --glow: 203 92.2% 50%;
+    --healthy: 151 49.2% 48.6%;
+    --positive: 151 49.2% 48.6%;
+    --prefill: 36 84.2% 62.7%;
+    --warning: 36 84.2% 62.7%;
+    --error: 203 92.2% 50%;
+    --idle: 4 82.9% 65.7%;
+    --disabled: 209 27.2% 70.4%;
+    --chart-1: 203 92.2% 50%;
+    --chart-2: 203 64.7% 70%;
+    --chart-3: 151 49.2% 48.6%;
+    --chart-4: 36 84.2% 62.7%;
+    --chart-5: 4 82.9% 65.7%;
+    --chart-6: 250 61.7% 68.2%;
+    --legend-1: 56 80% 62%;
+    --legend-2: 96 55% 58%;
+    --legend-3: 176 60% 52%;
+    --legend-4: 244 85% 76%;
+    --legend-5: 286 70% 74%;
+    --legend-6: 330 80% 72%;
+  }
+
+  [data-theme="night-harbor"] {
+    --background: 214 60% 4.5%;
+    --foreground: 205 35% 88%;
+    --card: 213 48% 7.5%;
+    --card-foreground: 205 35% 88%;
+    --popover: 213 38% 12%;
+    --popover-foreground: 205 35% 92%;
+    --primary: 203 80% 28%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 213 38% 12%;
+    --secondary-foreground: 205 35% 88%;
+    --muted: 214 55% 5.8%;
+    --muted-foreground: 210 18% 60%;
+    --accent: 213 38% 12%;
+    --accent-foreground: 205 35% 92%;
+    --destructive: 4 82.9% 65.7%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 213 30% 14%;
+    --input: 213 30% 14%;
+    --ring: 203 87.5% 55%;
+    --radius: 0.75rem;
+    --brand: 203 87.5% 55%;
+    --glow: 203 87.5% 55%;
+    --healthy: 151 49.2% 48.6%;
+    --positive: 151 49.2% 48.6%;
+    --prefill: 36 84.2% 62.7%;
+    --warning: 36 84.2% 62.7%;
+    --error: 203 92.2% 50%;
+    --idle: 4 82.9% 65.7%;
+    --disabled: 209 27.2% 70.4%;
+    --chart-1: 203 92.2% 50%;
+    --chart-2: 203 64.7% 70%;
+    --chart-3: 151 49.2% 48.6%;
+    --chart-4: 36 84.2% 62.7%;
+    --chart-5: 4 82.9% 65.7%;
+    --chart-6: 250 61.7% 68.2%;
+    --legend-1: 56 80% 62%;
+    --legend-2: 96 55% 58%;
+    --legend-3: 176 60% 52%;
+    --legend-4: 244 85% 76%;
+    --legend-5: 286 70% 74%;
+    --legend-6: 330 80% 72%;
+  }
+
+  [data-theme="foggy-dusk"] {
+    --background: 215 24% 14%;
+    --foreground: 210 25% 90%;
+    --card: 215 22% 18.5%;
+    --card-foreground: 210 25% 90%;
+    --popover: 215 20% 24%;
+    --popover-foreground: 210 25% 94%;
+    --primary: 203 50% 36%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 215 20% 24%;
+    --secondary-foreground: 210 25% 90%;
+    --muted: 215 24% 15.5%;
+    --muted-foreground: 213 14% 66%;
+    --accent: 215 20% 24%;
+    --accent-foreground: 210 25% 94%;
+    --destructive: 4 82.9% 65.7%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 215 17% 26%;
+    --input: 215 17% 26%;
+    --ring: 199 80% 62%;
+    --radius: 0.75rem;
+    --brand: 199 80% 62%;
+    --glow: 199 80% 62%;
+    --healthy: 151 49.2% 48.6%;
+    --positive: 151 49.2% 48.6%;
+    --prefill: 36 84.2% 62.7%;
+    --warning: 36 84.2% 62.7%;
+    --error: 203 92.2% 50%;
+    --idle: 4 82.9% 65.7%;
+    --disabled: 209 27.2% 70.4%;
+    --chart-1: 203 92.2% 50%;
+    --chart-2: 203 64.7% 70%;
+    --chart-3: 151 49.2% 48.6%;
+    --chart-4: 36 84.2% 62.7%;
+    --chart-5: 4 82.9% 65.7%;
+    --chart-6: 250 61.7% 68.2%;
+    --legend-1: 56 80% 64%;
+    --legend-2: 96 55% 60%;
+    --legend-3: 176 60% 55%;
+    --legend-4: 244 85% 80%;
+    --legend-5: 286 70% 78%;
+    --legend-6: 330 80% 76%;
+  }
+
+  [data-theme="cyan-tech"] {
+    --background: 193 70% 4.5%;
+    --foreground: 180 30% 88%;
+    --card: 190 55% 7.5%;
+    --card-foreground: 180 30% 88%;
+    --popover: 188 45% 11.5%;
+    --popover-foreground: 180 30% 92%;
+    --primary: 172 70% 24%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 188 45% 11.5%;
+    --secondary-foreground: 180 30% 88%;
+    --muted: 192 62% 5.8%;
+    --muted-foreground: 183 18% 60%;
+    --accent: 188 45% 11.5%;
+    --accent-foreground: 180 30% 92%;
+    --destructive: 4 82.9% 65.7%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 187 38% 14%;
+    --input: 187 38% 14%;
+    --ring: 170 92.5% 53.1%;
+    --radius: 0.5rem;
+    --brand: 170 92.5% 53.1%;
+    --glow: 170 92.5% 53.1%;
+    --healthy: 151 49.2% 48.6%;
+    --positive: 151 49.2% 48.6%;
+    --prefill: 36 84.2% 62.7%;
+    --warning: 36 84.2% 62.7%;
+    --error: 203 92.2% 50%;
+    --idle: 4 82.9% 65.7%;
+    --disabled: 209 27.2% 70.4%;
+    --chart-1: 203 92.2% 50%;
+    --chart-2: 203 64.7% 70%;
+    --chart-3: 151 49.2% 48.6%;
+    --chart-4: 36 84.2% 62.7%;
+    --chart-5: 4 82.9% 65.7%;
+    --chart-6: 250 61.7% 68.2%;
+    --legend-1: 60 80% 62%;
+    --legend-2: 105 55% 58%;
+    --legend-3: 132 50% 58%;
+    --legend-4: 265 75% 80%;
+    --legend-5: 300 70% 76%;
+    --legend-6: 330 80% 74%;
+  }
+
+  [data-theme="indigo-shift"] {
+    --background: 233 45% 7.5%;
+    --foreground: 228 40% 90%;
+    --card: 231 38% 11.5%;
+    --card-foreground: 228 40% 90%;
+    --popover: 231 32% 17%;
+    --popover-foreground: 228 40% 94%;
+    --primary: 252 42% 42%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 231 32% 17%;
+    --secondary-foreground: 228 40% 90%;
+    --muted: 233 42% 9.5%;
+    --muted-foreground: 229 20% 68%;
+    --accent: 231 32% 17%;
+    --accent-foreground: 228 40% 94%;
+    --destructive: 4 82.9% 65.7%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 231 26% 20%;
+    --input: 231 26% 20%;
+    --ring: 252 55.6% 70%;
+    --radius: 0.75rem;
+    --brand: 252 55.6% 70%;
+    --glow: 252 55.6% 70%;
+    --healthy: 151 49.2% 48.6%;
+    --positive: 151 49.2% 48.6%;
+    --prefill: 36 84.2% 62.7%;
+    --warning: 36 84.2% 62.7%;
+    --error: 203 92.2% 50%;
+    --idle: 4 82.9% 65.7%;
+    --disabled: 209 27.2% 70.4%;
+    --chart-1: 203 92.2% 50%;
+    --chart-2: 203 64.7% 70%;
+    --chart-3: 151 49.2% 48.6%;
+    --chart-4: 36 84.2% 62.7%;
+    --chart-5: 4 82.9% 65.7%;
+    --chart-6: 250 61.7% 68.2%;
+    --legend-1: 56 80% 62%;
+    --legend-2: 96 55% 58%;
+    --legend-3: 176 60% 52%;
+    --legend-4: 232 85% 74%;
+    --legend-5: 290 75% 72%;
+    --legend-6: 330 80% 70%;
+  }
+}
+
+/* Wordmark font for the lessing.systems credit (SIL Open Font License),
+   self-hosted from public/fonts so the dashboard works offline. */
+@font-face {
+  font-family: "Schibsted Grotesk";
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("/fonts/schibsted-grotesk-latin.woff2") format("woff2");
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01", "tnum";
+    /* A faint brand glow behind the header gives the canvas some depth
+       without competing with the data. */
+    background-image: radial-gradient(
+      1200px 480px at 12% -120px,
+      hsl(var(--glow) / 0.1),
+      transparent 70%
+    );
+    background-repeat: no-repeat;
+  }
+  ::selection {
+    background: hsl(var(--brand) / 0.35);
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+}
+
+@layer components {
+  /* Raised card surface with a hairline top highlight. */
+  .surface {
+    @apply rounded-xl border border-border bg-card;
+    box-shadow:
+      inset 0 1px 0 0 hsl(var(--foreground) / 0.04),
+      0 1px 2px 0 hsl(var(--background) / 0.6);
+  }
+  .eyebrow {
+    @apply text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground;
+  }
+}
+
+@keyframes state-ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  80%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+.animate-state-ping {
+  animation: state-ping 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-state-ping {
+    animation: none;
+  }
+}

@@ -1,0 +1,6 @@
+# LiteLLM proxies to scrape. Point `url` at your proxy's Prometheus endpoint.
+# Keys are NEVER inline: `key_env` names an environment variable (set it in .env).
+backends:
+  - name: primary
+    url: http://litellm.example.com:4000/metrics/
+    key_env: LITELLM_MASTER_KEY

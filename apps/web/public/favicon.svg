@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-3 0 40 40">
+  <!-- lessing.systems "L" mark. Light/dark colours match https://lessing.systems -->
+  <style>
+    .f { fill: #1f6eb0; }
+    .s { fill: none; stroke: #c9d400; stroke-width: 2.5; stroke-linejoin: round; }
+    @media (prefers-color-scheme: dark) {
+      .f { fill: #2f7fcb; }
+      .s { stroke: #e4f23a; }
+    }
+  </style>
+  <path class="f" d="M12 1h13L16 30h16l-5 9H2z"/>
+  <path class="s" d="M9 11 12 1h13"/>
+</svg>

@@ -1,0 +1,37 @@
+-- ============================================================================
+-- 006_latency_metric.sql — Add `metric` column to the latency hypertable
+-- Phase: DB Batch B6 (chunk 2b — Go scraper side contract)
+-- Mirrors the `metric` column added to the five token families in
+-- 005_token_families.sql.
+-- Date: 2026-09-30
+--
+-- Purpose:
+--   The `latency` hypertable (001) collapses eight distinct Prometheus latency
+--   metrics into one table with no way to tell them apart. TTFT
+--   (litellm_llm_api_time_to_first_token_metric) and
+--   litellm_deployment_latency_per_output_token must be selectable BY PROMETHEUS
+--   NAME so the API can derive prefill/decode tokens-per-second. This adds the
+--   same `metric text` column the token families already carry.
+--
+-- LOCKED CONTRACT:
+--   This is the column the Go scraper writes Row.MetricName into
+--   (apps/scraper/internal/store/store.go: latencyColumns / latencyValues). The
+--   column name and type (text) and role MUST match that Go change exactly.
+--
+-- APPLY ORDER (REQUIRED):
+--   This migration MUST be applied BEFORE the scraper binary that writes the
+--   `metric` column is redeployed. The scraper's latency INSERT lists `metric`
+--   explicitly; if the column does not exist the INSERT fails with
+--   `column "metric" of relation "latency" does not exist`.
+--
+-- Semantics:
+--   Additive only. Pre-existing latency rows keep metric IS NULL and are
+--   therefore EXCLUDED from TTFT / per-output-token derivation (the API filters
+--   on metric = '<prometheus name>', which never matches NULL).
+--
+-- Scope: single additive ALTER. Does NOT touch hypertable partitioning,
+--   compression, or retention settings; creates no continuous aggregates; does
+--   NOT backfill historical rows.
+-- ============================================================================
+
+ALTER TABLE latency ADD COLUMN IF NOT EXISTS metric text;

@@ -1,0 +1,75 @@
+services:
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile.dev
+    container_name: prismschism-web
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./apps/web:/app
+      - web_node_modules:/app/node_modules
+    environment:
+      - NODE_ENV=development
+      - MOCK_API=${MOCK_API:-false}
+      - API_PROXY_TARGET=http://api:8080
+      # Debug-only UI flag: shows the "unassigned" back-end card in the fleet
+      # panel. Read by the client via import.meta.env.VITE_DEBUG (Vite forwards
+      # only VITE_-prefixed vars). WEB SERVICE ONLY — not api, not scraper.
+      - VITE_DEBUG=1
+      # "by lessing.systems" credit in the header. On by default; set
+      # SHOW_CREDIT=false (shell or .env) to hide it. WEB SERVICE ONLY.
+      - VITE_SHOW_CREDIT=${SHOW_CREDIT:-true}
+      # Browser-tab icon. Unset = lessing.systems "L" mark; NONE = no icon; any
+      # other value = your own icon URL or path (e.g. /my-icon.png placed in
+      # apps/web/public, or https://example.com/icon.svg). WEB SERVICE ONLY.
+      - FAVICON=${FAVICON:-}
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile.dev
+    container_name: prismschism-api
+    environment:
+      - DATABASE_URL=postgres://litellm:${POSTGRES_PASSWORD:-litellm_dev_password}@db:5432/litellm
+      - API_PORT=8080
+      - SCRAPE_DOWN_AFTER_MS=30000
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: timescale/timescaledb:2.30.1-pg16
+    container_name: prismschism-db
+    environment:
+      - POSTGRES_DB=litellm
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-litellm_dev_password}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./infra/db/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  scraper:
+    build:
+      context: ./apps/scraper
+      dockerfile: Dockerfile
+    container_name: prismschism-scraper
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgres://litellm:${POSTGRES_PASSWORD:-litellm_dev_password}@db:5432/litellm
+      - SCRAPER_TARGETS=/config/targets.yaml
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./config:/config:ro
+    restart: unless-stopped
+
+volumes:
+  web_node_modules:
+  db_data:

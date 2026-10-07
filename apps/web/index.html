@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Prismschism</title>
+    <!-- Default tab icon: the lessing.systems "L" mark. Override or remove with
+         the FAVICON env var (see src/lib/favicon.ts). -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" data-default-icon />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" data-default-icon />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" data-default-icon />
+    <script>
+      (function () {
+        try {
+          var KEY = "prismschism:theme";
+          var valid = [
+            "deep-ocean",
+            "night-harbor",
+            "foggy-dusk",
+            "cyan-tech",
+            "indigo-shift",
+          ];
+          var stored = localStorage.getItem(KEY);
+          var theme = valid.indexOf(stored) !== -1 ? stored : "deep-ocean";
+          var el = document.documentElement;
+          el.setAttribute("data-theme", theme);
+          el.classList.add("dark");
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "deep-ocean");
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

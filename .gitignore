@@ -1,0 +1,14 @@
+.env
+temp/
+node_modules/
+.npm/
+# Go build cache (repo-root GOCACHE artifacts)
+.cache/
+# Docker CLI local state: buildx cache + desktop context config (machine-local, not project)
+.docker/
+# Go caches and build artifacts
+apps/scraper/go/
+**/go/pkg/mod/
+.gocache/
+gocache/
+*.test
