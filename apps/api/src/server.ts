@@ -49,7 +49,7 @@ import { Pool } from "pg";
 // ===========================================================================
 
 /** The metric families (apps/web/src/lib/types.ts `Metric`). */
-export const METRICS: readonly string[] = ["requests", "errors", "spend", "tokens", "latency", "decode_tps", "input_tps", "decode_tps_implied", "requests_per_min", "aggregate_output_tps"];
+export const METRICS: readonly string[] = ["requests", "errors", "spend", "tokens", "latency", "decode_tps", "input_tps", "decode_tps_implied", "requests_per_min", "aggregate_output_tps", "request_wall_clock"];
 
 /** Valid group-by keys. Raw-tier columns `model`/`api_provider` are carried
  *  into every cagg; identity columns are not. */
@@ -244,7 +244,7 @@ export type DerivedSource = { table: string; metric?: string };
  *  (`series`), or one summed series minus another from the SAME table
  *  (`series_diff`, e.g. upstream latency minus time-to-first-token). */
 export type DerivedSpec = {
-  unit: "token/s" | "req/min";
+  unit: "token/s" | "req/min" | "s";
   num: DerivedSource;
   den:
     | { kind: "bucket_seconds" }
@@ -318,6 +318,21 @@ export const DERIVED: Record<string, DerivedSpec> = {
     unit: "token/s",
     num: { table: "output_tokens" },
     den: { kind: "bucket_seconds" },
+  },
+  // Mean END-TO-END wall-clock seconds per request: Σ request-total-latency
+  // over the requests that completed in the bucket. Queue, prefill, TTFT and
+  // decode all count — this is the "how long does a task take on this backend"
+  // figure, so smaller is better, but it also scales with the workload's
+  // generation length (compare backends on similar tasks). Idle buckets have
+  // no requests and therefore no point (an absent numerator is not a 0 s
+  // request). No TTFT/ghost correction applies: nothing here is a rate.
+  request_wall_clock: {
+    unit: "s",
+    num: { table: "latency", metric: "litellm_request_total_latency_metric_sum" },
+    den: {
+      kind: "series",
+      source: { table: "latency", metric: "litellm_request_total_latency_metric_count" },
+    },
   },
 };
 

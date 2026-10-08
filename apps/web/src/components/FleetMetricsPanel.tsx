@@ -238,15 +238,17 @@ function CardHeader({
 }
 
 // One compact stats row per card. Callers pass values already run through
-// formatStat(), so a stat with no numeric data reads "—" and never 0.
-function CardStats({ stats }: { stats: { label: string; value: string }[] }) {
+// formatStat(), so a stat with no numeric data reads "—" and never 0. An
+// optional `info` becomes a native tooltip on the cell (used for the
+// direction-sensitive stats, e.g. "smaller is better").
+function CardStats({ stats }: { stats: { label: string; value: string; info?: string }[] }) {
   return (
     <dl
       data-testid="card-stats"
-      className="mb-3 grid grid-cols-3 divide-x divide-border overflow-hidden rounded-lg border border-border bg-muted/50"
+      className="mb-3 grid grid-cols-4 divide-x divide-border overflow-hidden rounded-lg border border-border bg-muted/50"
     >
       {stats.map((s) => (
-        <div key={s.label} className="flex min-w-0 flex-col-reverse px-3 py-2">
+        <div key={s.label} className="flex min-w-0 flex-col-reverse px-3 py-2" title={s.info}>
           <dt className="truncate text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
             {s.label}
           </dt>
@@ -539,6 +541,7 @@ function FrontendCard({
   range,
   decodeByModel,
   inputByModel,
+  wallClockByModel,
 }: {
   label: string;
   query: UseSeriesResult;
@@ -547,12 +550,14 @@ function FrontendCard({
   range: Range;
   decodeByModel: UseSeriesResult;
   inputByModel: UseSeriesResult;
+  wallClockByModel: UseSeriesResult;
 }) {
   const points = pointsFor(query, group);
-  // Both throughput stats come from the OPTIONAL group=model series, so they
-  // read "—" until the backend serves them.
+  // All three throughput stats come from the OPTIONAL group=model series, so
+  // they read "—" until the backend serves them.
   const decodeModelPoints = pointsFor(decodeByModel, group);
   const inputModelPoints = pointsFor(inputByModel, group);
+  const wallClockModelPoints = pointsFor(wallClockByModel, group);
   const caption = `requests · ${range}`;
 
   return (
@@ -579,6 +584,11 @@ function FrontendCard({
               { label: "Avg Decode t/s", value: formatStat(meanOfActive(decodeModelPoints), 1) },
               { label: "Input t/s", value: formatStat(meanOf(inputModelPoints), 1) },
               { label: "RPM", value: formatStat(meanExcludingStates(points), 1) },
+              {
+                label: "Wall-clock s",
+                value: formatStat(meanOfActive(wallClockModelPoints), 1),
+                info: "Average end-to-end wall-clock seconds per request: queue, prefill, TTFT and decode all count. Smaller is better when agents are fanning out — every parallel branch waits on its own request, so the slowest branch gates the whole fan-out. It also grows with task size, so compare models on similar workloads.",
+              },
             ]}
           />
           <GraphBlock label="Requests">
@@ -656,6 +666,7 @@ function DeploymentCard({
   decode,
   input,
   rpm,
+  wallClock,
 }: {
   label: string;
   group: string;
@@ -664,10 +675,12 @@ function DeploymentCard({
   decode: UseSeriesResult;
   input: UseSeriesResult;
   rpm: UseSeriesResult;
+  wallClock: UseSeriesResult;
 }) {
   const decodePoints = pointsFor(decode, group);
   const inputPoints = pointsFor(input, group);
   const rpmPoints = pointsFor(rpm, group);
+  const wallClockPoints = pointsFor(wallClock, group);
   const sep = label.indexOf(" · ");
   const title = sep === -1 ? label : label.slice(0, sep);
   const subtitle = sep === -1 ? undefined : label.slice(sep + 3);
@@ -683,18 +696,26 @@ function DeploymentCard({
         state={decode.isLoading || decode.isError ? undefined : currentState(decodePoints)}
       />
 
-      {/* Three numbers per back-end endpoint, all grouped by model_id: decode_tps,
-          input_tps and requests_per_min. Decode t/s is tokens per DECODE second,
-          so it averages active buckets only (meanOfActive); input t/s stays a
-          wall-clock mean; requests_per_min excludes idle+error buckets via
-          meanExcludingStates().
-          Each of the three renders 0 — never "—", never a hidden card — when its
+      {/* Four numbers per back-end endpoint, all grouped by model_id: decode_tps,
+          input_tps, requests_per_min and request_wall_clock. Decode t/s is tokens
+          per DECODE second, so it averages active buckets only (meanOfActive);
+          input t/s stays a wall-clock mean; requests_per_min excludes idle+error
+          buckets via meanExcludingStates(). request_wall_clock is the mean
+          END-TO-END seconds per request (queue+prefill+TTFT+decode) — smaller is
+          better — and reads "—" rather than 0 when absent, because 0 seconds is
+          not an observation.
+          The first three render 0 — never "—", never a hidden card — when their
           series is missing, empty, or scrape-down filler. */}
       <CardStats
         stats={[
           { label: "Decode t/s", value: statOrZero(meanOfActive(decodePoints), 1) },
           { label: "Input t/s", value: statOrZero(meanOf(inputPoints), 1) },
           { label: "Req/min", value: statOrZero(meanExcludingStates(rpmPoints), 1) },
+          {
+            label: "Wall-clock s",
+            value: formatStat(meanOfActive(wallClockPoints), 1),
+            info: "Average end-to-end wall-clock seconds per request: queue, prefill, TTFT and decode all count. Smaller is better when agents are fanning out — every parallel branch waits on its own request, so the slowest branch gates the whole fan-out. It also grows with task size, so compare backends on similar workloads.",
+          },
         ]}
       />
 
@@ -747,6 +768,10 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
   const inputByModel = useSeries("input_tps", range, "model");
   // Per-backend served requests per minute, grouped by model_id.
   const rpmByDeployment = useSeries("requests_per_min", range, "model_id");
+  // Mean end-to-end wall-clock seconds per request, per deployment and per
+  // front-end model. Optional like the series above: "—" when absent.
+  const wallClockByDeployment = useSeries("request_wall_clock", range, "model_id");
+  const wallClockByModel = useSeries("request_wall_clock", range, "model");
 
   // Longest retained window (raw data is kept 7 d): the all-time max source.
   // Optional like the series above — it never gates the panel.
@@ -924,6 +949,7 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
                 range={range}
                 decodeByModel={decodeByModel}
                 inputByModel={inputByModel}
+                wallClockByModel={wallClockByModel}
               />
             ))
           )}
@@ -985,6 +1011,7 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
                         decode={decodeByDeployment}
                         input={inputByDeployment}
                         rpm={rpmByDeployment}
+                        wallClock={wallClockByDeployment}
                       />
                     ))}
                   </div>

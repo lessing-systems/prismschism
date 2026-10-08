@@ -93,7 +93,7 @@ All knobs are environment variables on the `api` service in `docker-compose.yml`
 **What you get**
 
 - Combined token/s across the fleet, the peak single-bucket decode rate, the highest combined rate seen in the last 7 days, and a wall-clock fleet aggregate.
-- Per front-end model: requests, average decode t/s, input t/s, requests per minute, and a live state (streaming, prefill, idle, error).
+- Per front-end model: requests, average decode t/s, input t/s, requests per minute, average end-to-end wall-clock seconds per request, and a live state (streaming, prefill, idle, error).
 - Per back-end deployment: decode and input token rates, plus deployments that exist in LiteLLM but are idle.
 - Errors by provider, with a banner when the scraper loses contact with your proxy.
 - 1h / 24h / 7d ranges, five colour schemes, light and dark.
@@ -112,6 +112,7 @@ The scraper polls your proxy every ~15 seconds and stores counter deltas. The AP
 - *Input t/s* is an input-token rate. It is not true prefill throughput.
 - *Combined token/s (observed)* is measured throughput summed over deployments, not a rated maximum.
 - *Fleet aggregate token/s* is all output tokens over wall-clock seconds — the concurrency-inclusive frame where prefill, queue and idle time count as seconds with no tokens. Every fleet rate excludes ghost data and unassigned groups; hover the ⓘ on a tile for its exact definition.
+- *Wall-clock s* (on every back-end and front-end card) is the mean end-to-end seconds per request: queue, prefill, TTFT and decode all count. Smaller is better when agents are fanning out — every parallel branch waits on its own request, so the slowest branch gates the whole fan-out — but it also grows with task size, so compare backends on similar workloads. Hover the stat for the same note.
 - Retention: raw data 7 days, 1-minute rollups 30 days, 5-minute and 1-hour rollups 90 days.
 
 **Backups:** `infra/db/backup.sh` and `infra/db/restore.sh` dump and restore the database.

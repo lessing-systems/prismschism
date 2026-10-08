@@ -939,6 +939,10 @@ describe('derived metric surface', () => {
     expect(METRICS).toContain('aggregate_output_tps');
   });
 
+  it('METRICS includes the per-request wall-clock metric', () => {
+    expect(METRICS).toContain('request_wall_clock');
+  });
+
   it('GROUPS includes model_id (additive) and keeps model/api_provider', () => {
     expect(GROUPS).toContain('model_id');
     expect(GROUPS).toContain('model');
@@ -1128,6 +1132,19 @@ describe('buildDerivedSql — raw hypertable SUM(value) SQL (columns are pre-del
     expect(sql).not.toContain('ttft_classification');
   });
 
+  it('request_wall_clock divides total request latency by the request COUNT (mean seconds)', () => {
+    const sql = buildDerivedSql('request_wall_clock', '1m', 'model_id');
+    expect(sql).toContain('FROM latency');
+    expect(sql).toContain("metric = 'litellm_request_total_latency_metric_sum'");
+    expect(sql).toContain("metric = 'litellm_request_total_latency_metric_count'");
+    expect(sql).toContain('d.v AS den');
+    // a series denominator, not a constant bucket-seconds one
+    expect(sql).not.toContain('60 AS den');
+    // nothing rate-shaped here: no TTFT correction, no classifier join
+    expect(sql).not.toContain('time_to_first_token');
+    expect(sql).not.toContain('ttft_classification');
+  });
+
   it('rejects an unknown tier before interpolating', () => {
     expect(() => buildDerivedSql('decode_tps', '30m', 'model_id')).toThrow();
   });
@@ -1224,6 +1241,12 @@ describe('derivedPoints — rate math, omit idle (never a fake 0)', () => {
     expect(derivedPoints([row(600, 60)], 'model_id')).toEqual([
       { t: B, group: 'm1', value: 10, unit: 'token/s' },
     ]);
+  });
+
+  it('wall-clock rows pass the spec unit through (s, not token/s)', () => {
+    const pts = derivedPoints([row(300, 10)], 'model_id', 's');
+    expect(pts[0].value).toBe(30);
+    expect(pts[0].unit).toBe('s');
   });
 
   it('input_tps: input 1200 / ttft 4 -> 300 (TTFT division)', () => {

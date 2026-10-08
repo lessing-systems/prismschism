@@ -580,11 +580,12 @@ describe('FleetMetricsPanel — per-card stats', () => {
     render(<FleetMetricsPanel />);
 
     const card = screen.getAllByTestId('deployment-card')[0];
-    expect(statLabels(card)).toEqual(['Decode t/s', 'Input t/s', 'Req/min']);
+    expect(statLabels(card)).toEqual(['Decode t/s', 'Input t/s', 'Req/min', 'Wall-clock s']);
     // mean(10, 30) = 20. The input-token and requests_per_min series are absent,
     // so both read 0: an inventory-backed back-end card always renders, and a
-    // missing metric shows 0 rather than the "—" placeholder.
-    expect(statValues(card)).toEqual(['20', '0', '0']);
+    // missing metric shows 0 rather than the "—" placeholder. Wall-clock is
+    // absent here too but reads "—", not 0: 0 seconds is not an observation.
+    expect(statValues(card)).toEqual(['20', '0', '0', '\u2014']);
   });
 
   it('RPM excludes idle and error buckets', () => {
@@ -613,8 +614,9 @@ describe('FleetMetricsPanel — per-card stats', () => {
 
     const card = screen.getAllByTestId('deployment-card')[0];
     // decode mean = 40; Req/min = mean(10, 30) = 20 — the idle 0 and error 25 are
-    // out. The input-token series is absent, so the middle stat reads 0.
-    expect(statValues(card)).toEqual(['40', '0', '20']);
+    // out. The input-token series is absent, so the middle stat reads 0; the
+    // wall-clock series is absent, so the last stat reads "—".
+    expect(statValues(card)).toEqual(['40', '0', '20', '\u2014']);
   });
 });
 
@@ -655,13 +657,14 @@ describe('FleetMetricsPanel — front-end card stats + optional decode graph', (
     frontend = frontendSection();
     expect(frontend.textContent).toContain('Decode token/s');
     // First requests card == top-ranked model: decode mean 20, input mean 75,
-    // RPM = the request mean (250).
+    // RPM = the request mean (250). The optional wall-clock series is absent,
+    // so the fourth stat reads "—".
     const firstDls = frontend.querySelectorAll('[data-testid="card-stats"]');
     expect(firstDls.length).toBeGreaterThan(0);
     const values = Array.from(firstDls[0].querySelectorAll('dd')).map(
       (el) => el.textContent ?? '',
     );
-    expect(values).toEqual(['20', '75', '250']);
+    expect(values).toEqual(['20', '75', '250', '\u2014']);
   });
 });
 

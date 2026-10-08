@@ -8,10 +8,11 @@ export type Range = "1h" | "24h" | "7d";
 // backend-derived throughput/rate metrics. `input_tps` is an input-TOKEN rate
 // (renamed from a misleading prefill-based name — it is NOT true prefill
 // throughput), `requests_per_min` is the per-backend served requests-per-
-// minute rate, and `aggregate_output_tps` is the fleet wall-clock output rate
+// minute rate, `aggregate_output_tps` is the fleet wall-clock output rate
 // (Σ output tokens / bucket seconds — the concurrency-inclusive frame; no TTFT
-// enters it by construction). They all ride the same MetricPoint envelope, so
-// they join this union instead of forking a type.
+// enters it by construction), and `request_wall_clock` is the mean end-to-end
+// seconds per request (smaller is better). They all ride the same MetricPoint
+// envelope, so they join this union instead of forking a type.
 export type Metric =
   | "requests"
   | "errors"
@@ -21,6 +22,7 @@ export type Metric =
   | "decode_tps"
   | "input_tps"
   | "aggregate_output_tps"
+  | "request_wall_clock"
   | "requests_per_min";
 
 // 5-state traffic light. Matches CSS tokens --healthy/--prefill/--error/--idle/--disabled.
