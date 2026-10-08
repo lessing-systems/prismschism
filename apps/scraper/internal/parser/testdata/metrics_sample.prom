@@ -5,7 +5,9 @@
 #
 # Coverage required by the mapping spec:
 #   - *_created gauges with epoch values ~1.79e9 (proxy, spend)
-#   - two distinct series of litellm_proxy_total_requests_metric_total
+#   - two distinct series of litellm_requests_metric_total that differ ONLY by
+#     client_ip (the dropped-label collision regression: they must yield two
+#     rows with distinct delta-tracker keys)
 #   - litellm_spend_metric_total
 #   - litellm_input/output/total_tokens_metric_total
 #   - one full latency histogram: le buckets + _sum + _count
@@ -18,10 +20,10 @@
 # HELP process_start_time_seconds Start time of the process since unix epoch in seconds.
 # TYPE process_start_time_seconds gauge
 process_start_time_seconds 1.79029082814e+09
-# HELP litellm_proxy_total_requests_metric_total Total number of requests made to the proxy server - track number of client side requests
-# TYPE litellm_proxy_total_requests_metric_total counter
-litellm_proxy_total_requests_metric_total{api_key_alias="None",api_provider="openai",client_ip="192.0.2.20",end_user="None",hashed_api_key="litellm_proxy_master_key",model_id="orchestration-qwen38",org_alias="None",org_id="None",requested_model="orchestration",route="/v1/chat/completions",status_code="200",team="None",team_alias="None",user="default_user_id",user_agent="example-client/1.0",user_email="None"} 3.0
-litellm_proxy_total_requests_metric_total{api_key_alias="None",api_provider="anthropic",client_ip="192.0.2.21",end_user="None",hashed_api_key="other_key_hash",model_id="other-model-42",org_alias="None",org_id="None",requested_model="other-model",route="/v1/chat/completions",status_code="200",team="t1",team_alias="None",user="bob",user_agent="curl/8.5.0",user_email="None"} 1.0
+# HELP litellm_requests_metric_total Total number of LLM requests
+# TYPE litellm_requests_metric_total counter
+litellm_requests_metric_total{api_key_alias="None",api_provider="openai",client_ip="192.0.2.20",end_user="None",hashed_api_key="litellm_proxy_master_key",model="halogen-qwen3.8-flash-next",model_id="orchestration-qwen38",org_alias="None",org_id="None",requested_model="orchestration",team="None",team_alias="None",user="default_user_id",user_agent="example-client/1.0",user_email="None"} 3.0
+litellm_requests_metric_total{api_key_alias="None",api_provider="anthropic",client_ip="192.0.2.21",end_user="None",hashed_api_key="other_key_hash",model="other-model",model_id="other-model-42",org_alias="None",org_id="None",requested_model="other-model",team="t1",team_alias="None",user="bob",user_agent="curl/8.5.0",user_email="None"} 1.0
 # HELP litellm_proxy_total_requests_metric_created Total number of requests made to the proxy server
 # TYPE litellm_proxy_total_requests_metric_created gauge
 litellm_proxy_total_requests_metric_created{api_key_alias="None",api_provider="openai",hashed_api_key="litellm_proxy_master_key",model_id="orchestration-qwen38",requested_model="orchestration",route="/v1/chat/completions",status_code="200",user="default_user_id"} 1.7902913951892443e+09

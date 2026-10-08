@@ -16,7 +16,8 @@
 //     deployment's own average decode t/s), back-end state counts (latest
 //     bucket per deployment), front-end model count, and the window's peak
 //     decode bucket. Everything is derived from series already fetched here.
-//   * "Front-end Models"     — the request side: one card per top model with a
+//   * "Model Groups"         — the request side (LiteLLM's name for the public
+//     model a client calls): one card per top group with a
 //     stats row (Avg Decode t/s, Input t/s, RPM), a "Requests" graph, and a
 //     "Decode token/s" graph whenever group=model decode data exists; then the
 //     errors-by-provider state-bar cards.
@@ -893,7 +894,7 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
           <StateMix states={deploymentStates} />
         </SummaryTile>
         <SummaryTile
-          label="Front-end models"
+          label="Model groups"
           value={requestGroups.length}
           detail={`${streamingModels} served traffic in the last 3 min`}
         >
@@ -917,11 +918,12 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
         />
       </div>
 
-      {/* Front-end Models — the request side of the fleet: requests by model
-          (area charts) and errors by provider (state bars). */}
+      {/* Model Groups — LiteLLM's name for the public model a client calls
+          (the router group): requests by group (area charts) and errors by
+          provider (state bars). */}
       <section data-testid="frontend-section" className="mb-12">
         <SectionHeader
-          title="Front-end Models"
+          title="Model Groups"
           count={requestGroups.length}
           description="Request side · what clients call through the LiteLLM proxy"
           aside={

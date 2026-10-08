@@ -86,24 +86,36 @@ type Row struct {
 	User         string
 	Team         string
 	Family       string
+	// SeriesLabels is the FULL sorted "name=value" label set of the source
+	// Prometheus series, captured at parse time. It exists purely so the delta
+	// tracker's series key can never collide two distinct source series whose
+	// difference lives in a label the storage schema drops: the requests
+	// family carries client_ip, and two client IPs hitting the same deployment
+	// used to alternate one tracker key, producing garbage deltas (measured
+	// ~13k req/min on a card where the true rate was double digits). It is an
+	// in-memory key ingredient ONLY — it is never written to the database and
+	// never logged (the security contract below is untouched).
+	SeriesLabels string
 }
 
 // SeriesKey returns the deterministic series identifier used by the delta
 // tracker and store.
 //
-// Format: "Family|MetricName|name1=value1,name2=value2,..."
+// When the Row carries SeriesLabels (every parser-built Row does), the key is
+// "Family|MetricName|<full sorted label set>" — the FULL label set, including
+// labels that are dropped from storage, so two source series that differ only
+// in a dropped label (client_ip on the requests family) can never share one
+// delta-tracker key again.
 //
-// The label pairs are the 12 canonical labels (api_key_alias, api_provider,
+// Rows built without SeriesLabels (legacy/tests) fall back to the historical
+// format: the 12 canonical labels (api_key_alias, api_provider,
 // exception_class, exception_status, hashed_api_key, litellm_model_name,
 // model, model_id, route, status_code, team, user) filtered to non-empty
 // values, sorted by label NAME (lexicographic), and joined with commas.
-// exception_status and litellm_model_name are generic additions: they are
-// only ever non-empty for the counters and deployment_health families
-// respectively. exception_class, route and status_code are the requests-
-// family additions: they are only ever non-empty for the requests family.
-// In every case the empty-value guard means every other family's key stays
-// byte-for-byte unchanged.
 func (r Row) SeriesKey() string {
+	if r.SeriesLabels != "" {
+		return r.Family + "|" + r.MetricName + "|" + r.SeriesLabels
+	}
 	parts := make([][2]string, 0, 12)
 	if r.APIKeyAlias != "" {
 		parts = append(parts, [2]string{"api_key_alias", r.APIKeyAlias})
@@ -203,11 +215,15 @@ var metricFamily = map[string]string{
 	"litellm_guardrail_latency_seconds":               "latency",
 	"litellm_deployment_latency_per_output_token":     "latency",
 
-	// ── requests (4) ────────────────────────────────────────────
-	"litellm_proxy_total_requests_metric_total":    "requests",
-	"litellm_proxy_failed_requests_metric_total":   "requests",
-	"litellm_llm_api_failed_requests_metric_total": "requests",
-	"litellm_requests_metric_total":                "requests",
+	// ── requests (1) ────────────────────────────────────────────
+	// ONLY litellm_requests_metric_total is stored. The other request
+	// counters were dropped deliberately: they DOUBLE-COUNT the same requests
+	// (litellm_proxy_total_requests_metric_total advances in lockstep with it
+	// for every request), and the requests storage schema has no metric
+	// column, so the API's SUM(value) per bucket would count every request
+	// twice (or worse with the failed-counter variants). Measured on a real
+	// fleet: ~13k req/min on a card whose true rate was double digits.
+	"litellm_requests_metric_total": "requests",
 
 	// ── spend (1) ───────────────────────────────────────────────
 	"litellm_spend_metric_total": "spend",
@@ -327,6 +343,19 @@ func modelGroupFor(modelID string) (string, bool) {
 	return (*p)(modelID)
 }
 
+// seriesLabels renders the FULL label set of a series as sorted name=value
+// pairs joined by commas. Unlike the kept-label set this includes labels that
+// are never stored (client_ip, user_agent, end_user, org_*), so the delta
+// tracker's key distinguishes every source series.
+func seriesLabels(labels []*dto.LabelPair) string {
+	parts := make([]string, 0, len(labels))
+	for _, lp := range labels {
+		parts = append(parts, lp.GetName()+"="+lp.GetValue())
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
 // buildRow turns a metric series' labels into a Row for the given family,
 // value and unit.
 //
@@ -357,6 +386,7 @@ func buildRow(labels []*dto.LabelPair, ts time.Time, family string, name string,
 		Value:        value,
 		Unit:         unit,
 		Family:       family,
+		SeriesLabels: seriesLabels(labels),
 	}
 
 	// Family-scoped label population. ONLY these three families read the

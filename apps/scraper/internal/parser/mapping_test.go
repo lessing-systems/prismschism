@@ -33,9 +33,10 @@ func TestMetricFamilyMap(t *testing.T) {
 		"litellm_request_queue_time_seconds":                        "latency",
 		"litellm_guardrail_latency_seconds":                         "latency",
 		"litellm_deployment_latency_per_output_token":               "latency",
-		"litellm_proxy_total_requests_metric_total":                 "requests",
-		"litellm_proxy_failed_requests_metric_total":                "requests",
-		"litellm_llm_api_failed_requests_metric_total":              "requests",
+		// FIX (requests double-count): only litellm_requests_metric_total is
+		// stored. The proxy/failed request counters advance in lockstep with it
+		// for the same requests, and the requests schema has no metric column,
+		// so SUM(value) per bucket counted every request at least twice.
 		"litellm_requests_metric_total":                             "requests",
 		"litellm_spend_metric_total":                                "spend",
 		"litellm_remaining_tokens_metric":                           "limits",
@@ -66,6 +67,11 @@ func TestMetricFamilyMap(t *testing.T) {
 	}
 
 	skipped := []string{
+		// FIX (requests double-count): the overlapping request counters are no
+		// longer stored — see the mapped-block comment above.
+		"litellm_proxy_total_requests_metric_total",
+		"litellm_proxy_failed_requests_metric_total",
+		"litellm_llm_api_failed_requests_metric_total",
 		"litellm_proxy_total_requests_metric_created",
 		"litellm_spend_metric_created",
 		"litellm_input_tokens_metric_created",
@@ -239,12 +245,52 @@ func TestSeriesKey(t *testing.T) {
 			},
 			want: "requests|litellm_proxy_total_requests_metric_total|model=orchestration,route=/v1/chat/completions,status_code=200",
 		},
+		{
+			// FIX (client_ip collision): when a Row carries the full parsed
+			// label set, the key uses it verbatim — including labels that are
+			// dropped from storage (client_ip). Two client IPs hitting the
+			// same deployment must never share one delta-tracker key again.
+			name: "SeriesLabels takes precedence and keeps dropped labels",
+			row: Row{
+				Family:       "requests",
+				MetricName:   "litellm_requests_metric_total",
+				Model:        "tools",
+				ModelID:      "dep-glm",
+				SeriesLabels: "api_key_alias=key-a,api_provider=openai,client_ip=192.0.2.251,model_id=dep-glm,requested_model=tools,user=default_user_id",
+			},
+			want: "requests|litellm_requests_metric_total|api_key_alias=key-a,api_provider=openai,client_ip=192.0.2.251,model_id=dep-glm,requested_model=tools,user=default_user_id",
+		},
 	}
 	for _, c := range cases {
 		got := c.row.SeriesKey()
 		if got != c.want {
 			t.Errorf("%s: SeriesKey() = %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+// TestSeriesLabelsKeepDroppedLabelsDistinct verifies that two parser-built Rows
+// whose source series differ ONLY in a storage-dropped label (client_ip) get
+// distinct delta-tracker keys. This is the regression for the measured RPM
+// inflation: two client IPs used to alternate one key, producing garbage
+// deltas an order of magnitude above the true request rate.
+func TestSeriesLabelsKeepDroppedLabelsDistinct(t *testing.T) {
+	a := Row{
+		Family:       "requests",
+		MetricName:   "litellm_requests_metric_total",
+		Model:        "tools",
+		ModelID:      "dep-glm",
+		SeriesLabels: "api_key_alias=key-a,client_ip=192.0.2.251,model_id=dep-glm",
+	}
+	b := Row{
+		Family:       "requests",
+		MetricName:   "litellm_requests_metric_total",
+		Model:        "tools",
+		ModelID:      "dep-glm",
+		SeriesLabels: "api_key_alias=key-a,client_ip=192.0.2.253,model_id=dep-glm",
+	}
+	if a.SeriesKey() == b.SeriesKey() {
+		t.Error("SeriesKey(): two client_ip series collide; dropped labels must stay in the key")
 	}
 }
 
@@ -298,20 +344,20 @@ func TestParseSampleFile(t *testing.T) {
 	sort.Strings(keys)
 
 	expectedKeys := []string{
-		"latency|litellm_deployment_latency_per_output_token_count|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model_id=orchestration-qwen38,team=None",
-		"latency|litellm_deployment_latency_per_output_token_sum|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model_id=orchestration-qwen38,team=None",
-		"latency|litellm_request_total_latency_metric_count|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model=orchestration,model_id=orchestration-qwen38,team=None,user=default_user_id",
-		"latency|litellm_request_total_latency_metric_sum|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model=orchestration,model_id=orchestration-qwen38,team=None,user=default_user_id",
-		"limits|litellm_remaining_tokens_metric|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model_id=orchestration-qwen38",
-		"deployment_health|litellm_deployment_state|api_provider=openai,litellm_model_name=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38",
-		"deployment_health|litellm_deployment_state|api_provider=openai,litellm_model_name=orchestration,model_id=orchestration-qwen38",
-		"counters|litellm_deployment_cooled_down_total|api_provider=openai,exception_status=429,model_id=orchestration-qwen38",
-		"requests|litellm_proxy_total_requests_metric_total|api_key_alias=None,api_provider=anthropic,hashed_api_key=other_key_hash,model=other-model,model_id=other-model-42,route=/v1/chat/completions,status_code=200,team=t1,user=bob",
-		"requests|litellm_proxy_total_requests_metric_total|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model=orchestration,model_id=orchestration-qwen38,route=/v1/chat/completions,status_code=200,team=None,user=default_user_id",
-		"spend|litellm_spend_metric_total|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model=orchestration,model_id=orchestration-qwen38,team=None,user=default_user_id",
-		"input_tokens|litellm_input_tokens_metric_total|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model=orchestration,model_id=orchestration-qwen38,team=None,user=default_user_id",
-		"output_tokens|litellm_output_tokens_metric_total|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model=orchestration,model_id=orchestration-qwen38,team=None,user=default_user_id",
-		"total_tokens|litellm_total_tokens_metric_total|api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,model=orchestration,model_id=orchestration-qwen38,team=None,user=default_user_id",
+		"latency|litellm_deployment_latency_per_output_token_count|api_base=http://192.0.2.252:8731/v1,api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,litellm_model_name=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38,team=None",
+		"latency|litellm_deployment_latency_per_output_token_sum|api_base=http://192.0.2.252:8731/v1,api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,litellm_model_name=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38,team=None",
+		"latency|litellm_request_total_latency_metric_count|api_key_alias=None,api_provider=openai,end_user=None,hashed_api_key=litellm_proxy_master_key,model=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38,requested_model=orchestration,team=None,user=default_user_id",
+		"latency|litellm_request_total_latency_metric_sum|api_key_alias=None,api_provider=openai,end_user=None,hashed_api_key=litellm_proxy_master_key,model=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38,requested_model=orchestration,team=None,user=default_user_id",
+		"limits|litellm_remaining_tokens_metric|api_base=http://192.0.2.252:8731/v1,api_key_alias=None,api_provider=openai,hashed_api_key=litellm_proxy_master_key,litellm_model_name=halogen-qwen3.8-flash-next,model_group=orchestration,model_id=orchestration-qwen38",
+		"deployment_health|litellm_deployment_state|api_base=http://192.0.2.252:8731/v1,api_provider=openai,litellm_model_name=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38",
+		"deployment_health|litellm_deployment_state|api_base=http://192.0.2.252:8731/v1,api_provider=openai,litellm_model_name=orchestration,model_id=orchestration-qwen38",
+		"counters|litellm_deployment_cooled_down_total|api_base=http://192.0.2.252:8731/v1,api_provider=openai,exception_status=429,litellm_model_name=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38",
+		"requests|litellm_requests_metric_total|api_key_alias=None,api_provider=anthropic,client_ip=192.0.2.21,end_user=None,hashed_api_key=other_key_hash,model=other-model,model_id=other-model-42,org_alias=None,org_id=None,requested_model=other-model,team=t1,team_alias=None,user=bob,user_agent=curl/8.5.0,user_email=None",
+		"requests|litellm_requests_metric_total|api_key_alias=None,api_provider=openai,client_ip=192.0.2.20,end_user=None,hashed_api_key=litellm_proxy_master_key,model=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38,org_alias=None,org_id=None,requested_model=orchestration,team=None,team_alias=None,user=default_user_id,user_agent=example-client/1.0,user_email=None",
+		"spend|litellm_spend_metric_total|api_key_alias=None,api_provider=openai,client_ip=192.0.2.20,end_user=None,hashed_api_key=litellm_proxy_master_key,model=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38,requested_model=orchestration,team=None,user=default_user_id,user_agent=example-client/1.0,user_email=None",
+		"input_tokens|litellm_input_tokens_metric_total|api_key_alias=None,api_provider=openai,end_user=None,hashed_api_key=litellm_proxy_master_key,model=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38,requested_model=orchestration,team=None,user=default_user_id",
+		"output_tokens|litellm_output_tokens_metric_total|api_key_alias=None,api_provider=openai,end_user=None,hashed_api_key=litellm_proxy_master_key,model=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38,requested_model=orchestration,team=None,user=default_user_id",
+		"total_tokens|litellm_total_tokens_metric_total|api_key_alias=None,api_provider=openai,end_user=None,hashed_api_key=litellm_proxy_master_key,model=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38,requested_model=orchestration,team=None,user=default_user_id",
 	}
 	sort.Strings(expectedKeys)
 	if len(keys) != len(expectedKeys) {
@@ -520,7 +566,10 @@ func TestCooledDownCounters(t *testing.T) {
 	if !strings.Contains(r.SeriesKey(), "exception_status=429") {
 		t.Errorf("SeriesKey() missing exception_status: %q", r.SeriesKey())
 	}
-	want := "counters|litellm_deployment_cooled_down_total|api_provider=openai,exception_status=429,model_id=orchestration-qwen38"
+	// FIX (client_ip collision): parser Rows now key on the FULL label set, so
+	// labels that are dropped from storage (api_base, litellm_model_name) still
+	// appear in the key.
+	want := "counters|litellm_deployment_cooled_down_total|api_base=http://192.0.2.252:8731/v1,api_provider=openai,exception_status=429,litellm_model_name=halogen-qwen3.8-flash-next,model_id=orchestration-qwen38"
 	if r.SeriesKey() != want {
 		t.Errorf("SeriesKey() = %q, want %q", r.SeriesKey(), want)
 	}
@@ -586,8 +635,8 @@ func TestRequestsEmptyModelSkipped(t *testing.T) {
 	input := `
 # HELP litellm_proxy_total_requests_metric_total Total requests
 # TYPE litellm_proxy_total_requests_metric_total counter
-litellm_proxy_total_requests_metric_total{route="/metrics",requested_model="",status_code="200",user="None"} 1
-litellm_proxy_total_requests_metric_total{route="/v1/chat/completions",requested_model="orchestration",status_code="200",user="alice"} 5
+litellm_requests_metric_total{route="/metrics",requested_model="",status_code="200",user="None"} 1
+litellm_requests_metric_total{route="/v1/chat/completions",requested_model="orchestration",status_code="200",user="alice"} 5
 `
 	ts := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	res, err := Parse(input, ts, NewTripwire(10))
@@ -637,8 +686,8 @@ litellm_input_tokens_metric_total{api_provider="openai",requested_model="",model
 		t.Errorf("Model = %q, want empty (and still kept)", r.Model)
 	}
 	key := r.SeriesKey()
-	if key != "input_tokens|litellm_input_tokens_metric_total|api_provider=openai" {
-		t.Errorf("SeriesKey() = %q, want %q", key, "input_tokens|litellm_input_tokens_metric_total|api_provider=openai")
+	if key != "input_tokens|litellm_input_tokens_metric_total|api_provider=openai,model=,requested_model=" {
+		t.Errorf("SeriesKey() = %q, want %q", key, "input_tokens|litellm_input_tokens_metric_total|api_provider=openai,model=,requested_model=")
 	}
 	for _, seg := range []string{"route=", "status_code=", "exception_class="} {
 		if strings.Contains(key, seg) {
@@ -654,7 +703,7 @@ func TestRequestsRowFieldsPopulated(t *testing.T) {
 	input := `
 # HELP litellm_proxy_failed_requests_metric_total Failed requests
 # TYPE litellm_proxy_failed_requests_metric_total counter
-litellm_proxy_failed_requests_metric_total{requested_model="orchestration",route="/v1/chat/completions",status_code="576",exception_class="APIConnectionError",exception_status="500"} 1
+litellm_requests_metric_total{requested_model="orchestration",route="/v1/chat/completions",status_code="576",exception_class="APIConnectionError",exception_status="500"} 1
 `
 	ts := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	res, err := Parse(input, ts, NewTripwire(10))

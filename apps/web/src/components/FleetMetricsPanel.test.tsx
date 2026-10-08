@@ -377,7 +377,7 @@ describe('FleetMetricsPanel — two stacked sections', () => {
     render(<FleetMetricsPanel />);
 
     const { frontend, backend } = sections();
-    expect(frontend.querySelector('h2')?.textContent).toBe('Front-end Models');
+    expect(frontend.querySelector('h2')?.textContent).toBe('Model Groups');
     expect(backend.querySelector('h2')?.textContent).toBe('Back-end Deployments');
     // DOM order, not just presence: front-end precedes back-end.
     expect(

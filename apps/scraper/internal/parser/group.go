@@ -52,8 +52,10 @@ func isDeploymentScoped(family string) bool {
 //
 // Resolution order:
 //
-//  1. requested_model (when non-empty) — unchanged behaviour for series that
-//     carry it.
+//  1. requested_model (when non-empty and NOT itself a known model_id) —
+//     unchanged behaviour for series that carry it. When requested_model IS a
+//     deployment's model_id (the client addressed the deployment directly),
+//     it is a backend identity and resolution continues below.
 //  2. Non-deployment-scoped families: the raw "model" label — unchanged.
 //  3. Deployment-scoped family (token families or requests) without a usable
 //     model_id (absent, or the literal "None" sentinel): the raw "model"
@@ -63,8 +65,18 @@ func isDeploymentScoped(family string) bool {
 //  5. Deployment-scoped family with a model_id absent from the inventory:
 //     UnassignedGroup (never the raw model; the series is still emitted).
 func resolveGroup(labels []*dto.LabelPair, family string) string {
-	if rm := labelValue(labels, "requested_model"); rm != "" {
-		return rm
+	if rm := labelValue(labels, "requested_model"); rm != "" && rm != noneModelID {
+		// A client may address a deployment DIRECTLY: requested_model then
+		// equals a deployment's model_id (measured on a real fleet:
+		// requested_model="orchestration-glm53" alongside
+		// model_id="orchestration-glm53"). A deployment name is a BACKEND
+		// identity, not a front-end group — when requested_model IS a known
+		// model_id, fall through to the model_id-based resolution below
+		// instead of leaking a physical deployment name into front-end
+		// grouping (it used to surface as a phantom front-end group).
+		if _, isDeploymentName := modelGroupFor(rm); !isDeploymentName {
+			return rm
+		}
 	}
 	if !isDeploymentScoped(family) {
 		return labelValue(labels, "model")

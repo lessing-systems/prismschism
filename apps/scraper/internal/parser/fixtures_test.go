@@ -85,9 +85,9 @@ func TestUnknownMetricSkipped(t *testing.T) {
 
 func TestHealthCheckRowsSkipped(t *testing.T) {
 	ts := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	input := `# TYPE litellm_proxy_total_requests_metric_total counter
-litellm_proxy_total_requests_metric_total{api_provider="openai",hashed_api_key="litellm-internal-health-check",model="Raw-Upstream-Name"} 0
-litellm_proxy_total_requests_metric_total{api_provider="openai",hashed_api_key="h1",model="gpt-4"} 5
+	input := `# TYPE litellm_requests_metric_total counter
+litellm_requests_metric_total{api_provider="openai",hashed_api_key="litellm-internal-health-check",model="Raw-Upstream-Name"} 0
+litellm_requests_metric_total{api_provider="openai",hashed_api_key="h1",model="gpt-4"} 5
 `
 	res, err := Parse(input, ts, NewTripwire(10))
 	if err != nil {
