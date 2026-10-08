@@ -16,3 +16,6 @@ gocache/
 # scratch
 .dom.html
 .tooltip_*.png
+
+# session notes (never publish)
+pickup.md
