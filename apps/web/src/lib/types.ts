@@ -7,9 +7,11 @@ export type Range = "1h" | "24h" | "7d";
 // Metric union aligned to the LiteLLM metric families (minimal set), plus the
 // backend-derived throughput/rate metrics. `input_tps` is an input-TOKEN rate
 // (renamed from a misleading prefill-based name — it is NOT true prefill
-// throughput) and `requests_per_min` is the per-backend served requests-per-
-// minute rate. They all ride the same MetricPoint envelope, so they join this
-// union instead of forking a type.
+// throughput), `requests_per_min` is the per-backend served requests-per-
+// minute rate, and `aggregate_output_tps` is the fleet wall-clock output rate
+// (Σ output tokens / bucket seconds — the concurrency-inclusive frame; no TTFT
+// enters it by construction). They all ride the same MetricPoint envelope, so
+// they join this union instead of forking a type.
 export type Metric =
   | "requests"
   | "errors"
@@ -18,6 +20,7 @@ export type Metric =
   | "latency"
   | "decode_tps"
   | "input_tps"
+  | "aggregate_output_tps"
   | "requests_per_min";
 
 // 5-state traffic light. Matches CSS tokens --healthy/--prefill/--error/--idle/--disabled.

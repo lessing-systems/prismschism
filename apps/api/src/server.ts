@@ -48,8 +48,8 @@ import { Pool } from "pg";
 // Reference constants
 // ===========================================================================
 
-/** The five documented metric families (apps/web/src/lib/types.ts `Metric`). */
-export const METRICS: readonly string[] = ["requests", "errors", "spend", "tokens", "latency", "decode_tps", "input_tps", "decode_tps_implied", "requests_per_min"];
+/** The metric families (apps/web/src/lib/types.ts `Metric`). */
+export const METRICS: readonly string[] = ["requests", "errors", "spend", "tokens", "latency", "decode_tps", "input_tps", "decode_tps_implied", "requests_per_min", "aggregate_output_tps"];
 
 /** Valid group-by keys. Raw-tier columns `model`/`api_provider` are carried
  *  into every cagg; identity columns are not. */
@@ -265,11 +265,17 @@ export const DERIVED: Record<string, DerivedSpec> = {
   // summed decode seconds of the requests that completed in it. Output tokens and
   // both histograms are recorded at request completion, so they land in the same
   // scrape/bucket. The result is the token-weighted PER-STREAM decode rate (two
-  // concurrent streams add their decode seconds, not wall-clock). Caveat: TTFT is
-  // only observed for streaming calls — a non-streaming request's prefill stays in
-  // the denominator and biases that bucket low.
+  // concurrent streams add their decode seconds, not wall-clock). TTFT is only
+  // observed for streaming calls — a non-streaming request's prefill would stay
+  // in the denominator and bias that bucket low. Whether that bias is worth
+  // correcting is measured PER BACKEND over the served window: if a backend's
+  // estimated uncovered-TTFT share exceeds TTFT_CORRECTION_THRESHOLD_PCT
+  // (docker env, default 2%), its buckets get the estimate subtracted; below
+  // the threshold the raw difference is kept as-is (within margin of error).
+  // See derivedDiffCtes for the estimate itself.
   // (Previously Σ output tokens / bucket wall-clock seconds: that is average
-  // output throughput incl. idle, queue and prefill time — not a decode rate.)
+  // output throughput incl. idle, queue and prefill time — not a decode rate.
+  // That frame now exists as `aggregate_output_tps`.)
   decode_tps: {
     unit: "token/s",
     num: { table: "output_tokens" },
@@ -298,6 +304,20 @@ export const DERIVED: Record<string, DerivedSpec> = {
     num: { table: "requests" },
     den: { kind: "bucket_seconds" },
     perMinute: true,
+  },
+  // TRUE FLEET AGGREGATE output rate: Σ output tokens over the bucket's
+  // WALL-CLOCK seconds. The only frame in which a multi-backend sum is
+  // concurrency-inclusive and physically comparable: two streams decoding
+  // simultaneously are 2× the tokens in the same 60 s, not 2× the decode
+  // seconds. TTFT never enters this calculation — the denominator is wall-clock,
+  // so prefill/queue time is legitimately "seconds in which the fleet emitted no
+  // tokens" (a per-stream rate would subtract TTFT; an aggregate must not).
+  // Ghost-proofing lives client-side: the web tile sums only rostered
+  // (in_inventory !== false), unassigned-filtered groups of this series.
+  aggregate_output_tps: {
+    unit: "token/s",
+    num: { table: "output_tokens" },
+    den: { kind: "bucket_seconds" },
   },
 };
 
@@ -427,6 +447,24 @@ function derivedSumCtes(p: string, source: DerivedSource, group: string, interva
  *  SUM(source) − SUM(minus), both read from the same whitelisted table in one
  *  pass. A bucket with no `minus` rows subtracts 0; a bucket with no `source`
  *  rows yields NULL (unknowable, skipped by derivedPoints unless num is 0). */
+/** Parse the TTFT-correction threshold (percent) from docker env. Unset, empty
+ *  or non-numeric falls back to the documented default of 2; a negative value
+ *  is invalid and also falls back. 0 means "correct every backend with any
+ *  uncovered TTFT"; a huge value (e.g. 1e9) disables the correction entirely. */
+export function parseThresholdPct(raw: string | undefined): number {
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? v : 2;
+}
+
+/** Backend-level gate for the TTFT-coverage correction, in PERCENT of that
+ *  backend's decode seconds (docker env TTFT_CORRECTION_THRESHOLD_PCT, default
+ *  2). A backend whose estimated uncovered-TTFT share is at or below the
+ *  threshold is within margin of error and keeps its raw denominator; above it,
+ *  the estimate is subtracted from its buckets. */
+export const TTFT_CORRECTION_THRESHOLD_PCT = parseThresholdPct(
+  process.env.TTFT_CORRECTION_THRESHOLD_PCT,
+);
+
 function derivedDiffCtes(
   source: DerivedSource,
   minus: DerivedSource,
@@ -436,16 +474,278 @@ function derivedDiffCtes(
   if (source.table !== minus.table || !source.metric || !minus.metric) {
     throw new Error("series_diff needs two metrics of one table");
   }
+  const base =
+    `SUM(value) FILTER (WHERE metric = '${source.metric}') - ` +
+    `COALESCE(SUM(value) FILTER (WHERE metric = '${minus.metric}'), 0)`;
+  let vExpr = base;
+  let metricFilter = `'${source.metric}', '${minus.metric}'`;
+
+  // FIX (TTFT coverage): TTFT is a STREAMING-only counter. When a bucket also
+  // holds non-streaming requests (latency_count > ttft_count), their prefill
+  // stays in `base` and biases that bucket's decode rate LOW — measured on this
+  // fleet: one Strix-Halo backend -7.2% (20 s mean TTFT), the Spark pair only
+  // -0.03% (~90 ms TTFT). The aggregates cannot say WHICH requests lacked TTFT, so subtract
+  // an ESTIMATE: uncovered-request count × the bucket's own mean covered TTFT
+  // (Σttft / Σttft_count). Slightly inaccurate by design but always closer to
+  // the true decode seconds than leaving their whole latency in. Whether a
+  // backend is corrected at all is NOT decided here: the periodic classifier
+  // (runTtftClassifier) measures each backend's uncovered-TTFT share and ghosts,
+  // and stores a per-(axis, grp) `corrected` verdict in ttft_classification —
+  // run at API start, every TTFT_CLASSIFIER_INTERVAL_MIN, and whenever the
+  // deployment_inventory fingerprint changes (new/updated model at LiteLLM).
+  // The join is a LEFT JOIN: an unclassified backend (empty table, fresh DB)
+  // simply keeps its raw base. Guards:
+  //   - no covered requests in the bucket (ttft_count = 0) -> mean undefined ->
+  //     no subtraction, base is all we have;
+  //   - the estimate would eat the entire base (sparse bucket where uncovered
+  //     requests are much shorter than covered ones) -> keep base rather than
+  //     invent a <= 0 denominator (a skipped bucket loses real decode data).
+  // Count metrics follow the LiteLLM histogram convention (`_sum` -> `_count`).
+  // A spec whose metrics do not simply degrades to the plain difference: the
+  // count FILTERs sum to NULL -> COALESCE 0 -> missing 0.
+  if (source.metric.endsWith("_sum") && minus.metric.endsWith("_sum")) {
+    const srcCount = `${source.metric.slice(0, -"_sum".length)}_count`;
+    const minusCount = `${minus.metric.slice(0, -"_sum".length)}_count`;
+    metricFilter += `, '${srcCount}', '${minusCount}'`;
+    const vExpr =
+      `CASE WHEN c.corrected ` +
+      `AND d.ttft_n > 0 AND d.est > 0 AND d.est < d.base ` +
+      `THEN d.base - d.est ELSE d.base END`;
+    return (
+      `dagg AS (` +
+      `SELECT d.bucket, d.${group}, ${vExpr} AS v FROM (` +
+      `SELECT time_bucket(${interval}, ts) AS bucket, ${group}, ` +
+      `${base} AS base, ` +
+      `COALESCE(SUM(value) FILTER (WHERE metric = '${minusCount}'), 0) AS ttft_n, ` +
+      `GREATEST(COALESCE(SUM(value) FILTER (WHERE metric = '${srcCount}'), 0) ` +
+      `- COALESCE(SUM(value) FILTER (WHERE metric = '${minusCount}'), 0), 0) * ` +
+      `COALESCE(SUM(value) FILTER (WHERE metric = '${minus.metric}') ` +
+      `/ NULLIF(SUM(value) FILTER (WHERE metric = '${minusCount}'), 0), 0) AS est ` +
+      `FROM ${source.table} ` +
+      `WHERE ts >= now() - ($1 * interval '1 second') AND ${group} IS NOT NULL ` +
+      `AND metric IN (${metricFilter}) ` +
+      `GROUP BY bucket, ${group}) d ` +
+      `LEFT JOIN ttft_classification c ON c.axis = '${group}' AND c.grp = d.${group})`
+    );
+  }
   return (
     `dagg AS (` +
     `SELECT time_bucket(${interval}, ts) AS bucket, ${group}, ` +
-    `SUM(value) FILTER (WHERE metric = '${source.metric}') - ` +
-    `COALESCE(SUM(value) FILTER (WHERE metric = '${minus.metric}'), 0) AS v ` +
+    `${vExpr} AS v ` +
     `FROM ${source.table} ` +
     `WHERE ts >= now() - ($1 * interval '1 second') AND ${group} IS NOT NULL ` +
-    `AND metric IN ('${source.metric}', '${minus.metric}') ` +
+    `AND metric IN (${metricFilter}) ` +
     `GROUP BY bucket, ${group})`
   );
+}
+
+// ===========================================================================
+// TTFT/ghost classifier — per-backend verdicts, run periodically
+// ===========================================================================
+
+/** Parse a non-negative number from docker env with a fallback. Unset, empty,
+ *  whitespace, non-numeric or negative input yields the fallback (Number('') is
+ *  0, so emptiness is checked before the numeric parse). */
+export function parseEnvNumber(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? v : fallback;
+}
+
+/** How often the classifier re-measures backends, in minutes (docker env
+ *  TTFT_CLASSIFIER_INTERVAL_MIN, default 120 = the "every 2 hours" cadence).
+ *  0 disables the periodic run; the start run and the inventory watch remain. */
+export const TTFT_CLASSIFIER_INTERVAL_MIN = parseEnvNumber(
+  process.env.TTFT_CLASSIFIER_INTERVAL_MIN,
+  120,
+);
+
+/** How far back the classifier measures a backend, in minutes (docker env
+ *  TTFT_CLASSIFIER_WINDOW_MIN, default 1440 = 24h — long enough to average
+ *  streaming/non-streaming mix, short enough to track a fleet whose traffic
+ *  changes). */
+export const TTFT_CLASSIFIER_WINDOW_SECONDS =
+  parseEnvNumber(process.env.TTFT_CLASSIFIER_WINDOW_MIN, 1440) * 60;
+
+/** How often the classifier polls the deployment_inventory fingerprint for a
+ *  new/updated model at LiteLLM, in seconds (docker env
+ *  TTFT_CLASSIFIER_WATCH_S, default 60). 0 disables the watch. */
+export const TTFT_CLASSIFIER_WATCH_S = parseEnvNumber(
+  process.env.TTFT_CLASSIFIER_WATCH_S,
+  60,
+);
+
+/** Axes the classifier classifies (the inventory-backed group axes). */
+export const TTFT_CLASSIFIER_AXES: readonly string[] = ["model_id", "model"];
+
+/** The per-backend classifier INSERT. For every group seen in the window's
+ *  metrics OR the roster it writes one verdict row:
+ *    real_hw    — rostered in deployment_inventory WITH a non-empty api_base:
+ *                 a real hardware backend. A metric-only group (appears in
+ *                 metrics but was never inventoried — the "ghost data" case)
+ *                 or an inventory row without an endpoint is NOT real and is
+ *                 never corrected (ghosts must not enter any rate math).
+ *    share_pct  — estimated uncovered-TTFT seconds as a percent of the
+ *                 backend's raw decode seconds over the window (NULL when not
+ *                 measurable: no requests, or no decode seconds).
+ *    corrected  — real_hw AND share_pct > threshold: the backend mixes in
+ *                 enough non-streaming traffic that its decode buckets need
+ *                 the TTFT estimate subtracted (see derivedDiffCtes).
+ *    ghost_reason — NULL for real backends; else why it was classified a ghost.
+ * `$1` binds the window seconds, `$2` the threshold percent. `axis` must be a
+ * whitelisted inventory axis (INVENTORY_GROUP_COL) before interpolation. */
+export function buildTtftClassifierSql(axis: string, windowSeconds: number, thresholdPct: number): string {
+  const col = INVENTORY_GROUP_COL[axis];
+  if (col === undefined) throw new Error(`no inventory axis: ${axis}`);
+  const latSum = "litellm_llm_api_latency_metric_sum";
+  const ttftSum = "litellm_llm_api_time_to_first_token_metric_sum";
+  const latCount = "litellm_llm_api_latency_metric_count";
+  const ttftCount = "litellm_llm_api_time_to_first_token_metric_count";
+  const realExpr =
+    `a.in_inv AND EXISTS (SELECT 1 FROM deployment_inventory i ` +
+    `WHERE i.${col} = a.grp AND COALESCE(i.api_base, '') <> '')`;
+  return (
+    `INSERT INTO ttft_classification ` +
+    `(axis, grp, real_hw, activity_tokens, requests, ttft_requests, share_pct, corrected, ghost_reason, window_seconds) ` +
+    `WITH lat AS (` +
+    // The metric hypertables carry the group in a column named like the AXIS
+    // (`model` / `model_id`); only deployment_inventory renames it
+    // (INVENTORY_GROUP_COL), so the metric CTEs group by the axis name while
+    // the roster/real-hardware checks use the inventory column.
+    `SELECT ${axis} AS grp, ` +
+    `SUM(value) FILTER (WHERE metric = '${latSum}') AS lat_s, ` +
+    `SUM(value) FILTER (WHERE metric = '${ttftSum}') AS ttft_s, ` +
+    `SUM(value) FILTER (WHERE metric = '${latCount}') AS lat_n, ` +
+    `SUM(value) FILTER (WHERE metric = '${ttftCount}') AS ttft_n ` +
+    `FROM latency WHERE ts >= now() - ($1 * interval '1 second') AND ${axis} IS NOT NULL ` +
+    `AND metric IN ('${latSum}', '${ttftSum}', '${latCount}', '${ttftCount}') GROUP BY 1), ` +
+    `tok AS (SELECT ${axis} AS grp, SUM(value) AS tokens FROM output_tokens ` +
+    `WHERE ts >= now() - ($1 * interval '1 second') AND ${axis} IS NOT NULL GROUP BY 1), ` +
+    // bool_or, NOT a bare UNION of (grp, in_inv) rows: a group that is BOTH
+    // inventoried and emitting metrics would land twice — (grp, true) and
+    // (grp, false) — and violate the (axis, grp) primary key. This is the same
+    // union-of-flags shape as the 2x max-tile bug in buildDerivedSql.
+    `allg AS (SELECT grp, bool_or(in_inv) AS in_inv FROM (` +
+    `SELECT i.${col} AS grp, true AS in_inv FROM deployment_inventory i WHERE i.${col} IS NOT NULL ` +
+    `UNION ALL SELECT lat.grp, false FROM lat ` +
+    `UNION ALL SELECT tok.grp, false FROM tok) u GROUP BY grp), ` +
+    `s AS (SELECT a.grp, a.in_inv, ${realExpr} AS real_hw, ` +
+    `COALESCE(t.tokens, 0) AS tokens, COALESCE(l.lat_n, 0) AS lat_n, ` +
+    `COALESCE(l.ttft_n, 0) AS ttft_n, ` +
+    `CASE WHEN COALESCE(l.lat_n, 0) > 0 AND COALESCE(l.lat_s, 0) - COALESCE(l.ttft_s, 0) > 0 ` +
+    `THEN 100.0 * GREATEST(COALESCE(l.lat_n, 0) - COALESCE(l.ttft_n, 0), 0) ` +
+    `* COALESCE(l.ttft_s / NULLIF(l.ttft_n, 0), 0) ` +
+    `/ (l.lat_s - COALESCE(l.ttft_s, 0)) ELSE NULL END AS share_pct ` +
+    `FROM allg a LEFT JOIN lat l ON l.grp = a.grp LEFT JOIN tok t ON t.grp = a.grp) ` +
+    `SELECT '${axis}', s.grp, s.real_hw, s.tokens, s.lat_n, s.ttft_n, s.share_pct, ` +
+    `(s.real_hw AND s.share_pct IS NOT NULL AND s.share_pct > $2), ` +
+    `CASE WHEN NOT s.in_inv THEN 'metric-only: no deployment_inventory row' ` +
+    `WHEN NOT s.real_hw THEN 'inventory row without api_base' ` +
+    `ELSE NULL END, ` +
+    `$1 FROM s`
+  );
+}
+
+/** One axis's classifier result. */
+export type TtftClassifyResult = { axis: string; rows: number };
+
+/** Run the classifier for every axis: delete the axis's stale verdicts, then
+ *  insert fresh ones. Two statements rather than one atomic CTE because the
+ *  DELETE and the INSERT would target the same rows (a same-statement
+ *  data-modifying pair on one table risks a unique violation); the worst case
+ *  between them is an empty verdict set, which degrades to uncorrected rates.
+ *  `query` is the plain QueryFn so tests can stub it. */
+export async function runTtftClassifier(
+  query: QueryFn,
+  opts?: { windowSeconds?: number; thresholdPct?: number; axes?: readonly string[] },
+): Promise<TtftClassifyResult[]> {
+  const windowSeconds = opts?.windowSeconds ?? TTFT_CLASSIFIER_WINDOW_SECONDS;
+  const thresholdPct = opts?.thresholdPct ?? TTFT_CORRECTION_THRESHOLD_PCT;
+  const axes = opts?.axes ?? TTFT_CLASSIFIER_AXES;
+  const results: TtftClassifyResult[] = [];
+  for (const axis of axes) {
+    await query(`DELETE FROM ttft_classification WHERE axis = $1`, [axis]);
+    await query(buildTtftClassifierSql(axis, windowSeconds, thresholdPct), [
+      windowSeconds,
+      thresholdPct,
+    ]);
+    const counted = await query(
+      `SELECT count(*)::int AS n FROM ttft_classification WHERE axis = $1`,
+      [axis],
+    );
+    results.push({ axis, rows: Number(counted.rows[0]?.n ?? 0) });
+  }
+  return results;
+}
+
+/** deployment_inventory change fingerprint: row count plus a hash over the
+ *  identity columns. A new model at LiteLLM, a moved group or a swapped
+ *  raw_model all change it; last_alive churn does not. */
+export async function inventoryFingerprint(query: QueryFn): Promise<string> {
+  const res = await query(
+    `SELECT count(*)::int AS n, ` +
+      `COALESCE(md5(string_agg(model_id || '|' || COALESCE(model_group, '') || '|' || COALESCE(raw_model, ''), ',' ORDER BY model_id)), '') AS fp ` +
+      `FROM deployment_inventory`,
+    [],
+  );
+  const row = res.rows[0] as { n?: number; fp?: string } | undefined;
+  return `${row?.n ?? 0}:${row?.fp ?? ""}`;
+}
+
+/** The scheduler: classify once at start, then every
+ *  TTFT_CLASSIFIER_INTERVAL_MIN minutes, and re-classify early whenever the
+ *  deployment_inventory fingerprint changes (new/updated model at LiteLLM —
+ *  polled every TTFT_CLASSIFIER_WATCH_S seconds). Runs never overlap; a failed
+ *  run is logged and retried on the next trigger. Returns a stop() for tests. */
+export function startTtftClassifierScheduler(query: QueryFn): { stop: () => void } {
+  let running = false;
+  let lastFingerprint: string | null = null;
+  let lastRunOk = false;
+  const timers: ReturnType<typeof setInterval>[] = [];
+  const run = (why: string): void => {
+    if (running) return;
+    running = true;
+    void runTtftClassifier(query)
+      .then((results) => {
+        lastRunOk = true;
+        console.log(
+          `ttft classifier (${why}): ` +
+            results.map((r) => `${r.axis}=${r.rows} backends`).join(", "),
+        );
+      })
+      .catch((err: unknown) => {
+        lastRunOk = false;
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`ttft classifier (${why}) failed:`, message);
+      })
+      .finally(() => {
+        running = false;
+      });
+  };
+  run("start");
+  if (TTFT_CLASSIFIER_INTERVAL_MIN > 0) {
+    timers.push(setInterval(() => run("interval"), TTFT_CLASSIFIER_INTERVAL_MIN * 60_000));
+  }
+  if (TTFT_CLASSIFIER_WATCH_S > 0) {
+    timers.push(
+      setInterval(() => {
+        void inventoryFingerprint(query)
+          .then((fp) => {
+            const first = lastFingerprint === null;
+            const changed = !first && fp !== lastFingerprint;
+            lastFingerprint = fp;
+            // A failed start run is retried as soon as the DB answers at all.
+            if (changed || (first && !lastRunOk)) run(changed ? "inventory-change" : "retry");
+          })
+          .catch(() => {
+            /* inventory not reachable yet; the interval run will catch up */
+          });
+      }, TTFT_CLASSIFIER_WATCH_S * 1000),
+    );
+  }
+  return {
+    stop: () => timers.forEach((t) => clearInterval(t)),
+  };
 }
 
 /** Build the derived-metric query. `metric`/`tier`/`group` are whitelisted
@@ -525,8 +825,21 @@ export function buildDerivedSql(metric: string, tier: string, group: string): st
     `buckets AS (SELECT generate_series(date_trunc('${trunc}', now() - ($1 * interval '1 second')), ` +
     `now(), ${interval}) AS bucket)`;
   const allgroupsCte =
-    `allgroups AS (SELECT grp, true AS inv FROM roster ` +
-    `UNION SELECT DISTINCT n.${group} AS grp, false AS inv FROM nagg n)`;
+    // FIX (2x dup): this used to be a bare `roster UNION (SELECT DISTINCT grp,
+    // false FROM nagg)`. UNION dedupes on the WHOLE row (grp, inv), so a group
+    // that is BOTH inventoried and emitting metrics — every live deployment —
+    // produced TWO rows in allgroups: (grp, true) and (grp, false). The buckets
+    // CROSS JOIN then emitted TWO byte-identical points per (bucket, group), and
+    // any consumer that sums the raw series per bucket (the web's
+    // maxCombinedTokenRate, i.e. the "Max Combined Token/s (ever)" tile) counted
+    // every deployment twice: measured 2.000x inflation on both decode_tps and
+    // input_tps. Collapsing to ONE row per group with `bool_or(inv)` restores the
+    // intended flag semantics: true iff the group is rostered, false iff
+    // metric-only.
+    `allgroups AS (SELECT grp, bool_or(inv) AS inv FROM (` +
+    `SELECT grp, true AS inv FROM roster ` +
+    `UNION ALL SELECT DISTINCT n.${group} AS grp, false AS inv FROM nagg n` +
+    `) branches GROUP BY grp)`;
   const denJoin = isSeries ? ` LEFT JOIN dagg d ON d.bucket = b.bucket AND d.${group} = g.grp` : "";
   const denCte = isSeries ? `, ${denCtes}` : "";
   return (
@@ -1808,4 +2121,10 @@ if (isRunningAsMain()) {
   server.listen(port, () => {
     console.log(`api listening on :${port}`);
   });
+  // TTFT/ghost classifier: verdicts for the decode-rate correction and the
+  // real-backend sanity check. Runs at start, on the periodic cadence, and on
+  // any deployment_inventory change (new/updated model at LiteLLM). A failed
+  // run only logs — series queries degrade to uncorrected rates until the next
+  // trigger, never to errors.
+  startTtftClassifierScheduler(query);
 }

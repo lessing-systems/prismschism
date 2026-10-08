@@ -70,11 +70,29 @@ Everything below is in `docker-compose.yml` or `.env`:
 - **Tab icon:** set `FAVICON=` to your own icon URL or a file in `apps/web/public`, or `FAVICON=NONE` for no icon.
 - **Remove the lessing.systems logo:** the header shows a small "by lessing.systems" credit. Set `SHOW_CREDIT=false` in `.env` (and `docker compose up -d` again) to hide it.
 
+### The TTFT/ghost classifier
+
+On every API start — and then on an interval (default: every 2 hours) — the API runs a small per-backend classifier. Over a rolling window it measures, for each deployment:
+
+- **real hardware or ghost data:** the backend is counted as real only if it is in the deployment inventory with an actual endpoint. Metrics arriving for a model the roster has never seen (retired names, aliases, scrape artifacts) are classified as ghosts and excluded from every fleet rate and tile.
+- **how much TTFT is hiding in its decode rate:** time-to-first-token is only reported for streaming calls, so a backend that also serves non-streaming requests keeps some prefill time inside its decode denominator, biasing its decode t/s low.
+
+Backends whose estimated uncovered-TTFT share exceeds `TTFT_CORRECTION_THRESHOLD_PCT` (default **2**) get that share estimated out of their decode rates; everyone below stays untouched. The verdicts live in the `ttft_classification` table; a failed classifier run only delays the next correction, it never breaks the dashboard.
+
+All knobs are environment variables on the `api` service in `docker-compose.yml` (defaults in parentheses):
+
+| Variable | Meaning |
+| --- | --- |
+| `TTFT_CLASSIFIER_INTERVAL_MIN` | How often the classifier re-measures all backends (120 = every 2 hours). |
+| `TTFT_CLASSIFIER_WINDOW_MIN` | How far back each measurement looks (1440 = 24 h). |
+| `TTFT_CLASSIFIER_WATCH_S` | How often the roster is polled for new/updated models at LiteLLM (60); a change re-runs the classifier immediately. |
+| `TTFT_CORRECTION_THRESHOLD_PCT` | Uncovered-TTFT share above which a backend's decode rates get corrected (2). Set very high (e.g. `1000000`) to disable correction entirely. |
+
 ## More
 
 **What you get**
 
-- Combined token/s across the fleet, the peak single-bucket decode rate, and the highest combined rate seen in the last 7 days.
+- Combined token/s across the fleet, the peak single-bucket decode rate, the highest combined rate seen in the last 7 days, and a wall-clock fleet aggregate.
 - Per front-end model: requests, average decode t/s, input t/s, requests per minute, and a live state (streaming, prefill, idle, error).
 - Per back-end deployment: decode and input token rates, plus deployments that exist in LiteLLM but are idle.
 - Errors by provider, with a banner when the scraper loses contact with your proxy.
@@ -86,13 +104,14 @@ Everything below is in `docker-compose.yml` or `.env`:
 LiteLLM /metrics ──► scraper (Go) ──► TimescaleDB ──► API (Node) ──► web (React)
 ```
 
-The scraper polls your proxy every ~15 seconds and stores counter deltas. The API derives rates at query time. LiteLLM's own internal health-check traffic is dropped so it doesn't show up as phantom models.
+The scraper polls your proxy every ~15 seconds and stores counter deltas. The API derives rates at query time and runs the TTFT/ghost classifier on start and on an interval (see above). LiteLLM's own internal health-check traffic is dropped so it doesn't show up as phantom models.
 
 **Notes on the numbers**
 
-- *Decode t/s* is output tokens over time spent decoding (upstream latency minus time to first token), so it is a per-stream speed, not wall-clock throughput. Non-streaming calls bias it slightly low.
+- *Decode t/s* is output tokens over time spent decoding (upstream latency minus time to first token), so it is a per-stream speed, not wall-clock throughput. Non-streaming calls bias it slightly low — the classifier measures that bias per backend and subtracts an estimate once it exceeds 2% of the backend's decode time.
 - *Input t/s* is an input-token rate. It is not true prefill throughput.
 - *Combined token/s (observed)* is measured throughput summed over deployments, not a rated maximum.
+- *Fleet aggregate token/s* is all output tokens over wall-clock seconds — the concurrency-inclusive frame where prefill, queue and idle time count as seconds with no tokens. Every fleet rate excludes ghost data and unassigned groups; hover the ⓘ on a tile for its exact definition.
 - Retention: raw data 7 days, 1-minute rollups 30 days, 5-minute and 1-hour rollups 90 days.
 
 **Backups:** `infra/db/backup.sh` and `infra/db/restore.sh` dump and restore the database.

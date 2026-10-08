@@ -12,3 +12,7 @@ apps/scraper/go/
 .gocache/
 gocache/
 *.test
+
+# scratch
+.dom.html
+.tooltip_*.png

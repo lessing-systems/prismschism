@@ -101,6 +101,16 @@ function visibleSeries(points: MetricPoint[] | null | undefined): MetricPoint[] 
   return isDebugEnabled() ? series : dropUnassigned(series);
 }
 
+// Ghost-proof the points that feed rate-style fleet sums (combined tiles): keep
+// only groups the classifier/roster vouches for. `in_inventory` is false on
+// metric-only groups (present in metrics, absent from deployment_inventory —
+// retired model_ids, LiteLLM aliases, scrape artifacts) and absent on axes
+// without an inventory column (api_provider), which are kept. Combined with
+// visibleSeries, neither "unassigned" nor ghost data can reach a fleet sum.
+function rosteredVisible(points: MetricPoint[] | null | undefined): MetricPoint[] {
+  return visibleSeries(points).filter((p) => p.in_inventory !== false);
+}
+
 // Leading n groups for a (possibly still-loading/errored) series. The labeler
 // defaults to requestLabel (request-side); deployment-side callers pass
 // deploymentLabel so "unlabeled" is structurally impossible there.
@@ -339,11 +349,23 @@ function SeriesErrorCard({ title }: { title: string }) {
 
 // ── Fleet summary strip ─────────────────────────────────────────────────────
 
+// 12px inline info glyph for tile tooltips (stroke inherits currentColor).
+function InfoGlyph() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" className="h-3 w-3">
+      <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.25" />
+      <path d="M8 7.25v3.5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
+      <circle cx="8" cy="5.1" r="0.8" fill="currentColor" />
+    </svg>
+  );
+}
+
 function SummaryTile({
   label,
   value,
   unit,
   detail,
+  info,
   accent,
   testId,
   children,
@@ -352,6 +374,9 @@ function SummaryTile({
   value: ReactNode;
   unit?: string;
   detail?: ReactNode;
+  /** Long-form explanation, shown as a tooltip on an info glyph next to the
+   *  label (hover or keyboard focus). The visible `detail` line stays short. */
+  info?: string;
   accent?: boolean;
   testId?: string;
   children?: ReactNode;
@@ -359,19 +384,40 @@ function SummaryTile({
   return (
     <div
       data-testid={testId}
-      className={cn("surface relative overflow-hidden px-5 py-4", accent && "border-brand/40")}
+      className={cn("surface relative px-5 py-4", accent && "border-brand/40")}
     >
       {accent && (
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0"
-          style={{
-            background: "radial-gradient(420px 140px at 0% 0%, hsl(var(--brand) / 0.16), transparent 70%)",
-          }}
-        />
+        // The gradient is clipped in its own layer so the tile root can stay
+        // overflow-visible — the info tooltip must be able to leave the card.
+        <div aria-hidden="true" className="pointer-events-none absolute inset-0 overflow-hidden rounded-xl">
+          <div
+            className="absolute inset-0"
+            style={{
+              background: "radial-gradient(420px 140px at 0% 0%, hsl(var(--brand) / 0.16), transparent 70%)",
+            }}
+          />
+        </div>
       )}
       <div className="relative">
-        <div className="eyebrow">{label}</div>
+        <div className="eyebrow flex items-center gap-1.5">
+          <span className="truncate">{label}</span>
+          {info && (
+            <span
+              tabIndex={0}
+              role="note"
+              aria-label={info}
+              className="group/info relative inline-flex shrink-0 cursor-help text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:text-foreground"
+            >
+              <InfoGlyph />
+              <span
+                role="tooltip"
+                className="pointer-events-none absolute left-1/2 top-full z-30 mt-1.5 w-60 -translate-x-1/2 rounded-lg border border-border bg-card px-2.5 py-2 text-[11px] font-medium normal-case leading-snug tracking-normal text-muted-foreground opacity-0 shadow-lg transition-opacity duration-150 group-hover/info:opacity-100 group-focus-within/info:opacity-100"
+              >
+                {info}
+              </span>
+            </span>
+          )}
+        </div>
         <div className="mt-2 flex items-baseline gap-1.5">
           <span className="text-3xl font-semibold tabular-nums tracking-tight text-foreground">{value}</span>
           {unit && <span className="text-sm text-muted-foreground">{unit}</span>}
@@ -705,9 +751,17 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
   // Longest retained window (raw data is kept 7 d): the all-time max source.
   // Optional like the series above — it never gates the panel.
   const decodeAllTime = useSeries("decode_tps", "7d", "model_id");
-  const maxCombinedTps = maxCombinedTokenRate(decodeAllTime.data ?? []);
+  // Ghost-proofed: combined sums iterate the rostered, unassigned-filtered set
+  // only — ghost data (metric-only groups) must never reach a fleet rate.
+  const maxCombinedTps = maxCombinedTokenRate(rosteredVisible(decodeAllTime.data));
 
-  const combinedTps = combinedObservedTokenRate(decodeByDeployment.data ?? []);
+  const combinedTps = combinedObservedTokenRate(rosteredVisible(decodeByDeployment.data));
+
+  // True fleet AGGREGATE: Σ output tokens / bucket wall-clock seconds — the
+  // concurrency-inclusive frame (TTFT/prefill/queue legitimately count as
+  // seconds in which the fleet emitted no tokens). Ghost-proofed like above.
+  const aggregateByDeployment = useSeries("aggregate_output_tps", range, "model_id");
+  const maxAggregateTps = maxCombinedTokenRate(rosteredVisible(aggregateByDeployment.data));
 
   // "observed" is deliberate: this is measured throughput summed
   // over deployments, NOT a rated/max figure. Rendered during loading too, where
@@ -719,6 +773,7 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
       value={formatStat(combinedTps, 0)}
       unit="tok/s"
       detail={`sum across deployments · ${range}`}
+      info="Sum of each deployment's own average per-stream decode rate — idle and error buckets excluded. Per-stream frame: two concurrent streams add their decode seconds, not wall-clock, so this reads higher than the fleet aggregate. Backends that mix in non-streaming requests are classifier-corrected (estimated TTFT subtracted). Ghost and unassigned groups are excluded."
       accent
     />
   );
@@ -733,8 +788,9 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
   ) {
     return (
       <section aria-label="Fleet Metrics">
-        <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
+        <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-6">
           {combinedTile}
+          <Skeleton height={112} className="rounded-xl" />
           <Skeleton height={112} className="rounded-xl" />
           <Skeleton height={112} className="rounded-xl" />
           <Skeleton height={112} className="rounded-xl" />
@@ -796,7 +852,7 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
       <h2 id="fleet-metrics-heading" className="sr-only">Fleet Metrics</h2>
       <ScrapeBanner />
 
-      <div data-testid="fleet-summary" className="mb-10 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
+      <div data-testid="fleet-summary" className="mb-10 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-6">
         {combinedTile}
         <SummaryTile
           label={`Peak decode · ${range}`}
@@ -824,6 +880,15 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
           value={formatStat(maxCombinedTps, 0)}
           unit={maxCombinedTps === null ? undefined : "tok/s"}
           detail="best fleet-wide bucket · last 7d"
+          info="The highest single time bucket of the last 7 days: every deployment's per-stream decode rate summed per bucket, then the best bucket taken. Same frame as Combined (observed), so treat it as a best-case statistic, not a sustained rate. Ghost and unassigned groups are excluded."
+        />
+        <SummaryTile
+          testId="fleet-aggregate-tps"
+          label="Fleet Aggregate Token/s"
+          value={formatStat(maxAggregateTps, 0)}
+          unit={maxAggregateTps === null ? undefined : "tok/s"}
+          detail={`wall-clock · ${range}`}
+          info="The honest fleet-wide rate: all output tokens divided by wall-clock seconds, so concurrent backends add up and every second counts exactly once. Prefill, queue and idle time show up here as seconds in which the fleet emitted no tokens — the counterpart to the per-stream frames above, where TTFT is subtracted instead. Ghost and unassigned groups are excluded."
         />
       </div>
 

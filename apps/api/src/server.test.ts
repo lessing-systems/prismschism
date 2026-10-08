@@ -34,6 +34,7 @@ import {
   buildRawSeriesSql,
   buildSeriesSql,
   buildStateByGroup,
+  buildTtftClassifierSql,
   countHealthyDeployments,
   createRequestHandler,
   DERIVED,
@@ -42,14 +43,18 @@ import {
   deriveActivityStates,
   derivedPoints,
   GROUPS,
+  inventoryFingerprint,
   isDerivedMetric,
   kpiTotal,
   METRICS,
+  parseEnvNumber,
+  parseThresholdPct,
   RANGE_SECONDS,
   TIER_MAP,
   toBreakdown,
   toPoints,
   tierForRange,
+  TTFT_CLASSIFIER_AXES,
   validateBreakdownParams,
   validateKpiParams,
   validateSeriesParams,
@@ -930,6 +935,10 @@ describe('derived metric surface', () => {
     }
   });
 
+  it('METRICS includes the fleet-aggregate output rate', () => {
+    expect(METRICS).toContain('aggregate_output_tps');
+  });
+
   it('GROUPS includes model_id (additive) and keeps model/api_provider', () => {
     expect(GROUPS).toContain('model_id');
     expect(GROUPS).toContain('model');
@@ -1077,6 +1086,48 @@ describe('buildDerivedSql — raw hypertable SUM(value) SQL (columns are pre-del
     expect(() => buildDerivedSql('decode_tps', '1m', 'user')).toThrow();
   });
 
+  it('allgroups collapses to ONE row per group (bool_or flag), never two — the 2x max-tile dup bug', () => {
+    // FIX (2x dup): a bare `roster UNION (SELECT DISTINCT grp, false FROM nagg)`
+    // dedupes on the whole row (grp, inv), so every deployment that is both
+    // inventoried AND emitting metrics got two allgroups rows — (grp, true) and
+    // (grp, false) — and the buckets CROSS JOIN emitted two identical points per
+    // (bucket, group). Summing the raw series per bucket (the web's
+    // maxCombinedTokenRate) then double-counted every deployment: measured 2.000x
+    // on the "Max Combined Token/s (ever)" tile and on input_tps.
+    const sql = buildDerivedSql('decode_tps', '1m', 'model_id');
+    expect(sql).toContain('allgroups AS (SELECT grp, bool_or(inv) AS inv FROM (');
+    expect(sql).toContain(') branches GROUP BY grp)');
+    // the flag semantics stay: rostered -> true, metric-only -> false
+    expect(sql).toContain('SELECT grp, true AS inv FROM roster');
+    expect(sql).toContain('UNION ALL SELECT DISTINCT n.model_id AS grp, false AS inv FROM nagg n');
+    // and no bare union-of-flags survives anywhere
+    expect(sql).not.toContain('UNION SELECT DISTINCT n.');
+  });
+
+  it('decode_tps gates the TTFT estimate on the classifier verdict (axis-bound join)', () => {
+    const sql = buildDerivedSql('decode_tps', '1m', 'model_id');
+    expect(sql).toContain(
+      "LEFT JOIN ttft_classification c ON c.axis = 'model_id' AND c.grp = d.model_id",
+    );
+    expect(sql).toContain('CASE WHEN c.corrected');
+    // the correction is measured by the classifier, not compared per request
+    expect(sql).not.toContain('c.share >');
+    // the per-bucket estimate pieces are present (base / ttft_n / est)
+    expect(sql).toContain(' AS base, ');
+    expect(sql).toContain(' AS est ');
+  });
+
+  it('aggregate_output_tps divides output tokens by the bucket WALL-CLOCK seconds (no TTFT term)', () => {
+    const sql = buildDerivedSql('aggregate_output_tps', '1m', 'model_id');
+    expect(sql).toContain('FROM output_tokens');
+    expect(sql).toContain('SUM(value)');
+    expect(sql).toContain('60 AS den');
+    // the aggregate never touches latency/TTFT or the classifier table
+    expect(sql).not.toContain('latency');
+    expect(sql).not.toContain('time_to_first_token');
+    expect(sql).not.toContain('ttft_classification');
+  });
+
   it('rejects an unknown tier before interpolating', () => {
     expect(() => buildDerivedSql('decode_tps', '30m', 'model_id')).toThrow();
   });
@@ -1097,6 +1148,68 @@ describe('buildDerivedSql — raw hypertable SUM(value) SQL (columns are pre-del
       expect(sql).not.toContain('SUM(dt)');
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// TTFT/ghost classifier — per-backend verdicts (threshold via docker env)
+// ---------------------------------------------------------------------------
+
+describe('TTFT/ghost classifier', () => {
+  it('parseEnvNumber: unset/empty/non-numeric/negative fall back, 0 and positives pass', () => {
+    expect(parseEnvNumber(undefined, 7)).toBe(7);
+    expect(parseEnvNumber('', 7)).toBe(7);
+    expect(parseEnvNumber('abc', 7)).toBe(7);
+    expect(parseEnvNumber('-3', 7)).toBe(7);
+    expect(parseEnvNumber('0', 7)).toBe(0);
+    expect(parseEnvNumber('300', 7)).toBe(300);
+  });
+
+  it('parseThresholdPct defaults to 2 and accepts 0 / large values', () => {
+    expect(parseThresholdPct(undefined)).toBe(2);
+    expect(parseThresholdPct('nope')).toBe(2);
+    expect(parseThresholdPct('-1')).toBe(2);
+    expect(parseThresholdPct('0')).toBe(0);
+    expect(parseThresholdPct('2.5')).toBe(2.5);
+    expect(parseThresholdPct('1000000')).toBe(1000000);
+  });
+
+  it('buildTtftClassifierSql classifies both inventory axes with $1 window and $2 threshold', () => {
+    for (const axis of TTFT_CLASSIFIER_AXES) {
+      const sql = buildTtftClassifierSql(axis, 86400, 2);
+      expect(sql).toContain('INSERT INTO ttft_classification');
+      expect(sql).toContain(`SELECT '${axis}'`);
+      expect(sql).toContain("FROM latency WHERE ts >= now() - ($1 * interval '1 second')");
+      expect(sql).toContain("litellm_llm_api_latency_metric_sum");
+      expect(sql).toContain("litellm_llm_api_time_to_first_token_metric_sum");
+      expect(sql).toContain("litellm_llm_api_latency_metric_count");
+      expect(sql).toContain("litellm_llm_api_time_to_first_token_metric_count");
+      // real-hardware verdict needs a rostered endpoint; ghosts get a reason
+      expect(sql).toContain("COALESCE(i.api_base, '') <> ''");
+      expect(sql).toContain("'metric-only: no deployment_inventory row'");
+      expect(sql).toContain("'inventory row without api_base'");
+      // corrected = real_hw AND share_pct > threshold
+      expect(sql).toContain('(s.real_hw AND s.share_pct IS NOT NULL AND s.share_pct > $2)');
+    }
+  });
+
+  it('buildTtftClassifierSql rejects axes without an inventory column', () => {
+    expect(() => buildTtftClassifierSql('api_provider', 3600, 2)).toThrow();
+    expect(() => buildTtftClassifierSql('user', 3600, 2)).toThrow();
+  });
+
+  it('inventoryFingerprint hashes identity columns so a new/updated model changes it', async () => {
+    const seen: string[] = [];
+    let row = { n: 2, fp: 'abc' };
+    const query = (sql: string) => {
+      seen.push(sql);
+      return Promise.resolve({ rows: [row] });
+    };
+    expect(await inventoryFingerprint(query)).toBe('2:abc');
+    row = { n: 3, fp: 'def' };
+    expect(await inventoryFingerprint(query)).toBe('3:def');
+    expect(seen[0]).toContain('deployment_inventory');
+    expect(seen[0]).toContain('md5');
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,17 @@ services:
       - DATABASE_URL=postgres://litellm:${POSTGRES_PASSWORD:-litellm_dev_password}@db:5432/litellm
       - API_PORT=8080
       - SCRAPE_DOWN_AFTER_MS=30000
+      # TTFT/ghost classifier: per-backend verdicts in ttft_classification. A
+      # backend whose estimated uncovered-TTFT share exceeds the threshold
+      # (percent of its decode seconds) gets the estimate subtracted from its
+      # decode buckets; others keep raw values. Classifier runs at API start,
+      # every TTFT_CLASSIFIER_INTERVAL_MIN minutes, and whenever the
+      # deployment_inventory fingerprint changes (new/updated model at
+      # LiteLLM, polled every TTFT_CLASSIFIER_WATCH_S seconds).
+      - TTFT_CORRECTION_THRESHOLD_PCT=${TTFT_CORRECTION_THRESHOLD_PCT:-2}
+      - TTFT_CLASSIFIER_INTERVAL_MIN=${TTFT_CLASSIFIER_INTERVAL_MIN:-120}
+      - TTFT_CLASSIFIER_WINDOW_MIN=${TTFT_CLASSIFIER_WINDOW_MIN:-1440}
+      - TTFT_CLASSIFIER_WATCH_S=${TTFT_CLASSIFIER_WATCH_S:-60}
     depends_on:
       db:
         condition: service_healthy
