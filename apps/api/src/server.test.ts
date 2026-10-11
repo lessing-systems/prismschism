@@ -1626,6 +1626,55 @@ describe('buildActivitySql — activity state machine SQL', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Source guard — instance_health.status (raw scrape-error text) never leaves
+// the DB
+// ---------------------------------------------------------------------------
+
+// The scraper stores raw fetch-error text in instance_health.status
+// ("fetch http://<host>:<port>: context deadline exceeded"). The host/IP in
+// that string is an identity vector, so the API must NEVER select or serialize
+// it: the only instance_health query in server.ts is the fleet-wide
+// scrape-health probe, which reads max(ts) aggregates only. This guard fails
+// if any SQL in server.ts ever starts selecting `status` (or a bare `up`)
+// from instance_health — raw error text would then flow to API responses.
+
+describe('server.ts source guard — instance_health.status never leaves the DB', () => {
+  const src = readFileSync(new URL('./server.ts', import.meta.url), 'utf8');
+
+  /** Every backtick SQL literal in server.ts that touches instance_health. */
+  const instanceHealthSqls = (src.match(/`[^`]*FROM instance_health[^`]*`/g) ?? []).map((s) =>
+    s.toLowerCase(),
+  );
+
+  it('contains an instance_health query (positive control: the probe exists)', () => {
+    expect(instanceHealthSqls.length).toBeGreaterThan(0);
+  });
+
+  it('no instance_health SQL selects the raw status column', () => {
+    for (const sql of instanceHealthSqls) {
+      expect(sql, `instance_health SQL selects status: ${sql}`).not.toMatch(/\bstatus\b/);
+    }
+  });
+
+  it('no instance_health SQL selects a bare up column (only up aggregates in FILTER)', () => {
+    for (const sql of instanceHealthSqls) {
+      // `up` may appear only inside `FILTER (WHERE up ...)` / `(WHERE NOT up)`,
+      // never as a selected column (e.g. ", up" or "up AS").
+      expect(sql, `instance_health SQL selects up: ${sql}`).not.toMatch(/select\b[^`]*\bup\b(?![^`]*\bfilter\b)/);
+    }
+  });
+
+  it('the scrape-health probe exposes timestamps only, so no host/IP can reach a response', () => {
+    // The probe's select list is max(ts) aggregates — no text columns at all.
+    // (The SQL is split across concatenated fragments, so assert on the source.)
+    expect(src).toMatch(
+      /SELECT max\(ts\) FILTER \(WHERE up\) AS last_up_ts, max\(ts\) AS last_seen_ts/,
+    );
+    expect(instanceHealthSqls.join('\n')).not.toMatch(/https?:\/\//);
+  });
+});
+
 describe('server.ts source guard — activity metric literals match the scraper SSOT', () => {
   const src = readFileSync(new URL('./server.ts', import.meta.url), 'utf8');
 
