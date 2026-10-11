@@ -53,7 +53,6 @@
 import type { ReactNode } from "react";
 import { useScrapeStatus, useSeries } from "@/lib/queries";
 import { MetricLineChart } from "@/components/charts/MetricLineChart";
-import { StateBarChart } from "@/components/charts/StateBarChart";
 import { StateBadge, StateDot, StateLegend } from "@/components/StateIndicator";
 import { currentState } from "@/lib/currentState";
 import {
@@ -79,11 +78,8 @@ import { cn } from "@/lib/utils";
 import type { MetricPoint, MetricPointState, Range } from "@/lib/types";
 
 // Chart slot heights. Skeletons hold the same slot to avoid layout shift.
-const FRONTEND_CHART_PX = 168;
 const BACKEND_CHART_PX = 128;
 
-export const FRONTEND_GRID =
-  "grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3 min-[2000px]:grid-cols-4";
 export const BACKEND_GRID =
   "grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3 min-[2000px]:grid-cols-4";
 
@@ -285,7 +281,7 @@ function NoSeriesData({ note, height }: { note: string; height: number }) {
   );
 }
 
-// Legend for the requests groups. Each entry carries a swatch cycling the six
+// Legend for the deployment groups. Each entry carries a swatch cycling the six
 // categorical tokens; the "" group reads as "unlabeled".
 function Legend({ groups }: { groups: TopGroup[] }) {
   if (groups.length === 0) return null;
@@ -523,8 +519,6 @@ function ScrapeBanner() {
   );
 }
 
-// ── Front-end model card ────────────────────────────────────────────────────
-
 // A front-end model's current state. The requests series comes from continuous
 // aggregates that lag the raw tables by a minute or two, so on its own it misses
 // requests that just completed. The OPTIONAL decode_tps-by-model series is read
@@ -532,120 +526,6 @@ function ScrapeBanner() {
 // points are merged in: whichever of the two saw activity in the window wins.
 function frontendState(requestPoints: MetricPoint[], decodeModelPoints: MetricPoint[]) {
   return currentState([...requestPoints, ...decodeModelPoints]);
-}
-
-function FrontendCard({
-  label,
-  query,
-  group,
-  index,
-  range,
-  decodeByModel,
-  inputByModel,
-  wallClockByModel,
-}: {
-  label: string;
-  query: UseSeriesResult;
-  group: string;
-  index: number;
-  range: Range;
-  decodeByModel: UseSeriesResult;
-  inputByModel: UseSeriesResult;
-  wallClockByModel: UseSeriesResult;
-}) {
-  const points = pointsFor(query, group);
-  // All three throughput stats come from the OPTIONAL group=model series, so
-  // they read "—" until the backend serves them.
-  const decodeModelPoints = pointsFor(decodeByModel, group);
-  const inputModelPoints = pointsFor(inputByModel, group);
-  const wallClockModelPoints = pointsFor(wallClockByModel, group);
-  const caption = `requests · ${range}`;
-
-  return (
-    <article data-testid="frontend-card" className="surface p-4">
-      <CardHeader
-        title={label}
-        fullLabel={`${label} · requests (${range})`}
-        caption={caption}
-        swatch={legendColor(index)}
-        state={
-          query.isLoading || query.isError ? undefined : frontendState(points, decodeModelPoints)
-        }
-      />
-      {query.isLoading ? (
-        <Skeleton height={FRONTEND_CHART_PX} />
-      ) : query.isError ? (
-        <InlineError>Failed to load {label}</InlineError>
-      ) : (
-        <>
-          {/* RPM on the request side is the per-minute request mean, idle/error
-              buckets excluded. */}
-          <CardStats
-            stats={[
-              { label: "Avg Decode t/s", value: formatStat(meanOfActive(decodeModelPoints), 1) },
-              { label: "Input t/s", value: formatStat(meanOf(inputModelPoints), 1) },
-              { label: "RPM", value: formatStat(meanExcludingStates(points), 1) },
-              {
-                label: "Wall-clock s",
-                value: formatStat(meanOfActive(wallClockModelPoints), 1),
-                info: "Average end-to-end wall-clock seconds per request: queue, prefill, TTFT and decode all count. Smaller is better when agents are fanning out — every parallel branch waits on its own request, so the slowest branch gates the whole fan-out. It also grows with task size, so compare models on similar workloads.",
-              },
-            ]}
-          />
-          <GraphBlock label="Requests">
-            <MetricLineChart points={points} seriesIndex={index} height={FRONTEND_CHART_PX} />
-          </GraphBlock>
-          {/* Front-end decode throughput only renders when group=model decode
-              data exists; the dev mock does not serve tps metrics, so in dev this
-              graph is legitimately absent. */}
-          {decodeModelPoints.length > 0 && (
-            <GraphBlock label="Decode token/s">
-              <MetricLineChart
-                points={decodeModelPoints}
-                seriesIndex={(index + 1) % 6}
-                height={BACKEND_CHART_PX}
-              />
-            </GraphBlock>
-          )}
-        </>
-      )}
-    </article>
-  );
-}
-
-// No stats row on provider cards: they are provider-scoped, and decode /
-// input-token / requests-per-min do not map to a provider.
-function ProviderErrorCard({
-  label,
-  query,
-  group,
-  range,
-}: {
-  label: string;
-  query: UseSeriesResult;
-  group: string;
-  range: Range;
-}) {
-  const points = pointsFor(query, group);
-  return (
-    <article data-testid="provider-card" className="surface p-4">
-      <CardHeader
-        title={label}
-        fullLabel={`${label} · errors (${range})`}
-        caption={`errors by provider · ${range}`}
-        state={query.isLoading || query.isError ? undefined : currentState(points)}
-      />
-      {query.isLoading ? (
-        <Skeleton height={FRONTEND_CHART_PX} />
-      ) : query.isError ? (
-        <InlineError>Failed to load {label}</InlineError>
-      ) : (
-        <GraphBlock label="Errors">
-          <StateBarChart points={points} height={FRONTEND_CHART_PX} />
-        </GraphBlock>
-      )}
-    </article>
-  );
 }
 
 // ── Back-end deployment cards ───────────────────────────────────────────────
@@ -766,13 +646,11 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
   // errors or comes back empty. Gating on them would let a slow or failed
   // secondary series skeleton the whole dashboard.
   const decodeByModel = useSeries("decode_tps", range, "model");
-  const inputByModel = useSeries("input_tps", range, "model");
   // Per-backend served requests per minute, grouped by model_id.
   const rpmByDeployment = useSeries("requests_per_min", range, "model_id");
   // Mean end-to-end wall-clock seconds per request, per deployment and per
   // front-end model. Optional like the series above: "—" when absent.
   const wallClockByDeployment = useSeries("request_wall_clock", range, "model_id");
-  const wallClockByModel = useSeries("request_wall_clock", range, "model");
 
   // Longest retained window (raw data is kept 7 d): the all-time max source.
   // Optional like the series above — it never gates the panel.
@@ -822,7 +700,7 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
           <Skeleton height={112} className="rounded-xl" />
           <Skeleton height={112} className="rounded-xl" />
         </div>
-        <div className={FRONTEND_GRID}>
+        <div className={BACKEND_GRID}>
           {[0, 1, 2].map((i) => (
             <Skeleton key={i} height={320} className="rounded-xl" />
           ))}
@@ -848,9 +726,6 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
     ),
     deploymentPoints,
   );
-
-  const requestsTitle = `requests by model (${range})`;
-  const errorsTitle = `errors by provider (${range})`;
 
   // Empty only when every GATING series resolved without error and produced no
   // groups. The input-token rate is a secondary graph on the same cards, so it must
@@ -918,61 +793,6 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
         />
       </div>
 
-      {/* Model Groups — LiteLLM's name for the public model a client calls
-          (the router group): requests by group (area charts) and errors by
-          provider (state bars). */}
-      <section data-testid="frontend-section" className="mb-12">
-        <SectionHeader
-          title="Model Groups"
-          count={requestGroups.length}
-          description="Request side · what clients call through the LiteLLM proxy"
-          aside={
-            <div className="flex flex-col items-end gap-2">
-              {/* The legend scale has exactly six distinct colours, so it stays
-                  capped at LEGEND_MAX entries even though up to PANEL_TOP_N cards
-                  are rendered. */}
-              <Legend groups={requestGroups.slice(0, LEGEND_MAX)} />
-              <div aria-hidden="true" className="h-px w-full bg-border/40" />
-              <StateLegend />
-            </div>
-          }
-        />
-
-        <div data-testid="frontend-grid" className={FRONTEND_GRID}>
-          {requestsByModel.isError ? (
-            <SeriesErrorCard title={requestsTitle} />
-          ) : (
-            requestGroups.map((g, i) => (
-              <FrontendCard
-                key={`req:${g.group}`}
-                label={g.label}
-                query={requestsByModel}
-                group={g.group}
-                index={i}
-                range={range}
-                decodeByModel={decodeByModel}
-                inputByModel={inputByModel}
-                wallClockByModel={wallClockByModel}
-              />
-            ))
-          )}
-
-          {errorsByProvider.isError ? (
-            <SeriesErrorCard title={errorsTitle} />
-          ) : (
-            errorGroups.map((g) => (
-              <ProviderErrorCard
-                key={`err:${g.group}`}
-                label={g.label}
-                query={errorsByProvider}
-                group={g.group}
-                range={range}
-              />
-            ))
-          )}
-        </div>
-      </section>
-
       {/* Back-end Deployments — the deployment side of the fleet: ONE card per
           top deployment group, carrying both throughput graphs and the stats. */}
       <section data-testid="backend-section">
@@ -980,6 +800,16 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
           title="Back-end Deployments"
           count={deploymentGroups.length}
           description="Deployment side · one row per model family, sorted by name"
+          aside={
+            <div className="flex flex-col items-end gap-2">
+              {/* The legend scale has exactly six distinct colours, so it stays
+                  capped at LEGEND_MAX entries even though up to PANEL_TOP_N cards
+                  are rendered. */}
+              <Legend groups={deploymentGroups.slice(0, LEGEND_MAX)} />
+              <div aria-hidden="true" className="h-px w-full bg-border/40" />
+              <StateLegend />
+            </div>
+          }
         />
 
         {decodeByDeployment.isError ? (
