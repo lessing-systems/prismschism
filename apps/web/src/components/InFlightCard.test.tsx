@@ -48,6 +48,15 @@ beforeEach(() => {
 });
 
 describe('InFlightCard', () => {
+  it('renders the flat full-width grid container (gauge | sessions | backends)', () => {
+    state.inflight = sample();
+    render(<InFlightCard />);
+    const grid = screen.getByTestId('in-flight-grid');
+    expect(grid.className).toContain('grid');
+    expect(grid.className).toContain('grid-cols-1');
+    expect(grid.className).toContain('md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)_minmax(0,2fr)]');
+  });
+
   it('renders the current gauge value and unit', () => {
     state.inflight = sample();
     render(<InFlightCard />);
