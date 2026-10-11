@@ -2787,25 +2787,29 @@ async function getInflight(base: string, qs: string): Promise<{ status: number; 
 }
 
 /**
- * A `vi.fn()` fake `QueryFn` for /api/inflight, which issues THREE queries
- * (the latest `in_flight` row, the distinct-total row, and the per-model
- * groups). It dispatches on the SQL text so each query can be canned
- * independently; `fail` names one query that rejects with a pg-style error
- * carrying `code` (42P01 = undefined_table) to pin the missing-table tolerance.
+ * A `vi.fn()` fake `QueryFn` for /api/inflight, which issues FOUR queries
+ * (the latest `in_flight` row, the distinct-total row, the per-model
+ * groups, and the per-backend lane pivot). It dispatches on the SQL text so
+ * each query can be canned independently; `fail` names one query that rejects
+ * with a pg-style error carrying `code` (42P01 = undefined_table) to pin the
+ * missing-table tolerance.
  */
 function makeInflightQuery(spec: {
   inflight?: any[];
   total?: any[];
   byModel?: any[];
-  fail?: 'inflight' | 'total' | 'byModel';
+  lanes?: any[];
+  fail?: 'inflight' | 'total' | 'byModel' | 'lanes';
   code?: string;
 }): FakeQuery {
   return vi.fn(async (sql: string) => {
-    const which: 'inflight' | 'total' | 'byModel' = sql.includes('FROM in_flight')
+    const which: 'inflight' | 'total' | 'byModel' | 'lanes' = sql.includes('FROM in_flight')
       ? 'inflight'
-      : sql.includes('distinct_count')
-        ? 'byModel'
-        : 'total';
+      : sql.includes('FROM backend_lanes')
+        ? 'lanes'
+        : sql.includes('distinct_count')
+          ? 'byModel'
+          : 'total';
     if (spec.fail === which) {
       const err = new Error(`injected failure: ${which}`);
       if (spec.code) (err as any).code = spec.code;
@@ -2839,16 +2843,19 @@ describe('GET /api/inflight — integration', () => {
             { modelId: 'llama', distinct: 1 },
           ],
         },
+        backends: [],
       });
-      expect(q).toHaveBeenCalledTimes(3);
-      // The gauge query binds nothing; the two session queries bind the window
-      // in MINUTES and count-distinct the identity row constructor.
+      expect(q).toHaveBeenCalledTimes(4);
+      // The gauge and lanes queries bind nothing; the two session queries bind
+      // the window in MINUTES and count-distinct the identity row constructor.
       const sqls = q.mock.calls.map((c) => String(c[0]));
       expect(sqls.filter((s) => s.includes('FROM in_flight'))).toHaveLength(1);
+      expect(sqls.filter((s) => s.includes('FROM backend_lanes'))).toHaveLength(1);
       expect(sqls.filter((s) => s.includes('COUNT(DISTINCT ("user", api_key_alias, team))'))).toHaveLength(2);
       for (const call of q.mock.calls) {
-        if (String(call[0]).includes('FROM in_flight')) expect(call[1]).toEqual([]);
-        else expect(call[1]).toEqual([15]);
+        if (String(call[0]).includes('FROM in_flight') || String(call[0]).includes('FROM backend_lanes')) {
+          expect(call[1]).toEqual([]);
+        } else expect(call[1]).toEqual([15]);
       }
     } finally {
       await srv.close();
@@ -2873,7 +2880,8 @@ describe('GET /api/inflight — integration', () => {
         distinctTotal: 5,
         byModel: [{ modelId: 'gpt-4', distinct: 5 }],
       });
-      expect(q).toHaveBeenCalledTimes(3);
+      expect(body.backends).toEqual([]);
+      expect(q).toHaveBeenCalledTimes(4);
       const messages = warnSpy.mock.calls.map((c) => String(c[0]));
       expect(messages.some((m) => m.includes('in_flight table missing'))).toBe(true);
     } finally {
@@ -2902,7 +2910,10 @@ describe('GET /api/inflight — integration', () => {
         expect(status).toBe(200);
         expect(body.sessions.windowMinutes).toBe(bound);
         for (const call of q.mock.calls) {
-          if (!String(call[0]).includes('FROM in_flight')) expect(call[1]).toEqual([bound]);
+          const sql = String(call[0]);
+          if (!sql.includes('FROM in_flight') && !sql.includes('FROM backend_lanes')) {
+            expect(call[1]).toEqual([bound]);
+          }
         }
       }
     } finally {
@@ -2919,6 +2930,64 @@ describe('GET /api/inflight — integration', () => {
       expect(body.inflight).toEqual({ ts: null, value: null, unit: 'count' });
       expect(body.sessions.distinctTotal).toBe(1);
     } finally {
+      await srv.close();
+    }
+  });
+
+  it('serves per-backend lane gauges from the latest tick, nulling missing metrics, ordered by backend', async () => {
+    const q = makeInflightQuery({
+      inflight: [{ ts: '2026-10-11T00:00:00.000Z', value: '2', unit: 'count' }],
+      total: [{ distinct_total: '1' }],
+      byModel: [],
+      lanes: [
+        // The pivot row for 'alpha': waiting has no row at its latest tick.
+        { backend: 'alpha', running_lane: '3', waiting_lane: null, max_lane: '10' },
+        // 'beta': numeric strings (pg hands DOUBLE PRECISION back as text via
+        // some drivers) and a non-numeric max degrade per the mapper rules.
+        { backend: 'beta', running_lane: '0', waiting_lane: '4', max_lane: 'not-a-number' },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.backends).toEqual([
+        { backend: 'alpha', running: 3, waiting: null, max: 10 },
+        { backend: 'beta', running: 0, waiting: 4, max: null },
+      ]);
+      // The lanes query is point-in-time: it binds nothing (no windowMinutes).
+      const lanesCalls = q.mock.calls.filter((c) => String(c[0]).includes('FROM backend_lanes'));
+      expect(lanesCalls).toHaveLength(1);
+      expect(lanesCalls[0][1]).toEqual([]);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('tolerates a missing backend_lanes table (42P01): 200 with empty backends and the rest intact', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeInflightQuery({
+      inflight: [{ ts: '2026-10-11T00:00:00.000Z', value: '2', unit: 'count' }],
+      total: [{ distinct_total: '2' }],
+      byModel: [{ model_id: 'gpt-4', distinct_count: '2' }],
+      fail: 'lanes',
+      code: '42P01',
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, 'windowMinutes=30');
+      expect(status).toBe(200);
+      expect(body.backends).toEqual([]);
+      expect(body.inflight).toEqual({ ts: '2026-10-11T00:00:00.000Z', value: 2, unit: 'count' });
+      expect(body.sessions).toEqual({
+        windowMinutes: 30,
+        distinctTotal: 2,
+        byModel: [{ modelId: 'gpt-4', distinct: 2 }],
+      });
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('backend_lanes table missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
       await srv.close();
     }
   });

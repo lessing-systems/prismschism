@@ -1773,6 +1773,34 @@ export function buildInflightSessionsByModelSql(): string {
   );
 }
 
+/** One pivoted `buildInflightBackendsSql` row: a backend and its latest-tick
+ *  lane gauges. Each `*_lane` column is the FILTER-pivoted metric value and is
+ *  null when the backend's latest tick carries no row for that metric. */
+export interface InflightBackendRow {
+  backend?: unknown;
+  running_lane?: unknown;
+  waiting_lane?: unknown;
+  max_lane?: unknown;
+}
+
+/** The latest tick per backend from `backend_lanes`, pivoted to one row per
+ *  backend. `latest` takes MAX(ts) per backend; joining back on (backend, ts)
+ *  and MAX(...)-FILTER-ing per metric takes each metric's value AT that tick —
+ *  a metric absent from the tick pivots to null, not 0. No parameters: like
+ *  the gauge, this is a point-in-time reading (windowMinutes does not apply).
+ *  Ordered by backend ascending so the payload is deterministic. */
+export function buildInflightBackendsSql(): string {
+  return (
+    `WITH latest AS (SELECT backend, MAX(ts) AS ts FROM backend_lanes GROUP BY backend) ` +
+    `SELECT l.backend, ` +
+    `MAX(l.value) FILTER (WHERE l.metric = 'running') AS running_lane, ` +
+    `MAX(l.value) FILTER (WHERE l.metric = 'waiting') AS waiting_lane, ` +
+    `MAX(l.value) FILTER (WHERE l.metric = 'max') AS max_lane ` +
+    `FROM backend_lanes l JOIN latest ON latest.backend = l.backend AND latest.ts = l.ts ` +
+    `GROUP BY l.backend ORDER BY l.backend ASC`
+  );
+}
+
 /** True when the error is pg's 42P01 (undefined_table) — the shape the
  *  /api/inflight handler tolerates for the not-yet-migrated `in_flight`
  *  table (deploy order: API before migration). */
@@ -1816,6 +1844,37 @@ export interface InflightModelGroup {
   distinct: number;
 }
 
+/** A finished backends entry — the `backends` items of the /api/inflight
+ *  contract: per-backend latest-tick lane gauges, each null when the backend's
+ *  latest tick has no row for that metric (never fabricated to 0). */
+export interface InflightBackend {
+  backend: string;
+  running: number | null;
+  waiting: number | null;
+  max: number | null;
+}
+
+/** Pivoted backend_lanes rows -> `[{ backend, running, waiting, max }]`. A
+ *  null/undefined or non-numeric metric degrades to null ("no reading" stays
+ *  null, never a fabricated 0, matching the gauge precedent). Re-sorted by
+ *  backend ascending so the payload is deterministic even though the SQL
+ *  already orders it. */
+export function toInflightBackends(rows: readonly InflightBackendRow[]): InflightBackend[] {
+  const lane = (v: unknown): number | null => {
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  return rows
+    .map((row) => ({
+      backend: row.backend === null || row.backend === undefined ? "" : String(row.backend),
+      running: lane(row.running_lane),
+      waiting: lane(row.waiting_lane),
+      max: lane(row.max_lane),
+    }))
+    .sort((a, b) => (a.backend < b.backend ? -1 : a.backend > b.backend ? 1 : 0));
+}
+
 /** Sessions byModel rows -> `[{ modelId, distinct }]`. A null model_id group
  *  becomes "(unknown)" (the convention the breakdown handler already uses);
  *  a non-numeric count degrades to 0. Sorted by distinct descending with ties
@@ -1840,9 +1899,11 @@ export function toInflightModelGroups(rows: readonly InflightSessionsRow[]): Inf
  *
  *  Robustness for deploy order: if the in_flight query fails with pg's 42P01
  *  (undefined_table — migration 009 not applied yet), the gauge degrades to
- *  `{ ts: null, value: null }` and the response is still 200; the sessions
- *  queries never touch in_flight and must always work. Any OTHER query
- *  failure is a 500, as in every other handler here. */
+ *  `{ ts: null, value: null }` and the response is still 200; if the
+ *  backend_lanes query fails with 42P01 (migration 010 not applied yet),
+ *  `backends` degrades to `[]` the same way. The sessions queries never touch
+ *  either table and must always work. Any OTHER query failure is a 500, as in
+ *  every other handler here. */
 function handleInflight(query: QueryFn, params: URLSearchParams, res: ServerResponse): void {
   const raw = params.get("windowMinutes");
   let windowMinutes = DEFAULT_INFLIGHT_WINDOW_MINUTES;
@@ -1881,8 +1942,21 @@ function handleInflight(query: QueryFn, params: URLSearchParams, res: ServerResp
     [windowMinutes]
   ).then((result) => result.rows as InflightSessionsRow[]);
 
-  Promise.all([inflightRow, totalRow, byModelRows])
-    .then(([row, total, groups]) => {
+  // The backends-lane query: 42P01 (migration 010 not yet applied) degrades
+  // to an empty array, the same tolerance shape as the in_flight gauge above.
+  const backendRows: Promise<InflightBackendRow[]> = query(buildInflightBackendsSql(), [])
+    .then((result) => result.rows as InflightBackendRow[])
+    .catch((err: unknown) => {
+      if (isPgUndefinedTable(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn("backend_lanes table missing (migration 010 not applied); emitting empty backends:", message);
+        return [];
+      }
+      throw err;
+    });
+
+  Promise.all([inflightRow, totalRow, byModelRows, backendRows])
+    .then(([row, total, groups, backends]) => {
       const n = Number(total?.distinct_total);
       sendJson(res, 200, {
         inflight: toInflight(row),
@@ -1891,6 +1965,7 @@ function handleInflight(query: QueryFn, params: URLSearchParams, res: ServerResp
           distinctTotal: Number.isFinite(n) ? n : 0,
           byModel: toInflightModelGroups(groups),
         },
+        backends: toInflightBackends(backends),
       });
     })
     .catch((err: unknown) => {
