@@ -20,3 +20,11 @@ Everything committed here is permanently visible to anyone. Treat your diff as p
 Stop and tell the repo owner immediately. A follow-up commit does not remove it from git history; the history may need rewriting.
 
 ---
+
+### The ghost-filter trap (read before adding any grouping or slice)
+
+Any new aggregation that groups or slices by `model_id` (or raw label sets) MUST resolve through `deployment_inventory` the way the existing fleet views do:
+- Drop series with no `deployment_inventory` row ("metric-only" ghosts) and inventory rows without `api_base`.
+- Never surface raw deployment names as front-end groups, and never bucket unresolved rows as "None"/"Other" — that resurrects the phantom-group bug.
+- Reference implementations: `apps/scraper/internal/parser/group.go:69-91` (backend identity vs front-end group), `buildTtftClassifierSql` in `apps/api/src/server.ts` (ghost_reason logic), `FleetMetricsPanel.tsx:111-113` (fleet sums drop `in_inventory === false` points).
+- If your slice renders "None" or "Other" buckets, you reintroduced the bug: fix the slice, not the label.
