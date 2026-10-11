@@ -932,6 +932,7 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
                   capped at LEGEND_MAX entries even though up to PANEL_TOP_N cards
                   are rendered. */}
               <Legend groups={requestGroups.slice(0, LEGEND_MAX)} />
+              <div aria-hidden="true" className="h-px w-full bg-border/40" />
               <StateLegend />
             </div>
           }
