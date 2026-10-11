@@ -56,6 +56,7 @@ var familyWhitelist = map[string]bool{
 	"deployment_health": true,
 	"counters":          true,
 	"in_flight":         true,
+	"backend_lanes":     true,
 }
 
 // PG implements Writer on top of database/sql with the pgx driver.
@@ -88,7 +89,7 @@ func (p *PG) WriteMetrics(ctx context.Context, rows []parser.Row) error {
 	byFamily := make(map[string][]parser.Row)
 	for _, r := range rows {
 		if !familyWhitelist[r.Family] {
-			return fmt.Errorf("write metrics: unknown family %q (allowed: input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, latency, requests, spend, limits, deployment_health, counters, in_flight)", r.Family)
+			return fmt.Errorf("write metrics: unknown family %q (allowed: input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, latency, requests, spend, limits, deployment_health, counters, in_flight, backend_lanes)", r.Family)
 		}
 		byFamily[r.Family] = append(byFamily[r.Family], r)
 	}
@@ -246,6 +247,20 @@ var familyColumns = map[string]familySchema{
 		columns: []string{"ts", "model_id", "value", "unit"},
 		values: func(r parser.Row) []any {
 			return []any{r.TS, r.ModelID, r.Value, r.Unit}
+		},
+	},
+	// backend_lanes: per-backend tensorfold lane gauges (see
+	// infra/db/migrations/010_backend_lanes.sql). The "metric" column carries
+	// the short lane name the parser derives in buildRow (Row.MetricName:
+	// "running"/"waiting"/"max"/"streams_"+state) — same pattern as the
+	// latency family's metric slot. "backend" comes from Row.Backend (""
+	// when the source series carries no backend label, per the table's
+	// NOT NULL DEFAULT ''). All four source metrics are GAUGES: rows arrive
+	// with IsCounter=false, so the delta path stores raw readings, no deltas.
+	"backend_lanes": {
+		columns: []string{"ts", "backend", "metric", "value", "unit"},
+		values: func(r parser.Row) []any {
+			return []any{r.TS, r.Backend, r.MetricName, r.Value, r.Unit}
 		},
 	},
 }
