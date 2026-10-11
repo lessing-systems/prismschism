@@ -3,6 +3,7 @@ import { ThemeToggle } from '@/components/ThemeToggle';
 import { RangeToggle, RANGES } from '@/components/RangeToggle';
 import { LiveStatus } from '@/components/LiveStatus';
 import { FleetMetricsPanel } from '@/components/FleetMetricsPanel';
+import { InFlightCard } from '@/components/InFlightCard';
 import { VendorCredit } from '@/components/VendorCredit';
 import type { Range } from '@/lib/types';
 
@@ -61,6 +62,9 @@ function App() {
       </header>
 
       <main className="mx-auto max-w-[2400px] px-4 pb-16 pt-6 sm:px-6 lg:px-10">
+        <div className="mb-6 max-w-md">
+          <InFlightCard />
+        </div>
         <FleetMetricsPanel range={range} />
       </main>
     </div>
