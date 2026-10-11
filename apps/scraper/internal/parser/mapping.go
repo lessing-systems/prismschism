@@ -41,8 +41,8 @@ const (
 //
 // Family is one of the five token families (input_tokens, output_tokens,
 // reasoning_tokens, cached_tokens, total_tokens) or one of "latency",
-// "requests", "spend", "limits", "deployment_health", "counters" (see
-// metricFamily). It is the storage-side grouping key the raw table is
+// "requests", "spend", "limits", "deployment_health", "counters", "in_flight"
+// (see metricFamily). It is the storage-side grouping key the raw table is
 // partitioned by.
 //
 // MetricName is the exact Prometheus metric name (for histograms, the base
@@ -254,6 +254,18 @@ var metricFamily = map[string]string{
 	// Generic low-cardinality event counters, differentiated by the
 	// exception_status label. Not health state.
 	"litellm_deployment_cooled_down_total": "counters",
+
+	// -- in_flight (1) --
+	// litellm_in_flight_requests is a Prometheus GAUGE — the number of HTTP
+	// requests currently in flight on the LiteLLM worker. It is UNLABELED at
+	// the source (no model_id / alias): the gauge is global to the process.
+	// As a gauge it keeps its raw value through the delta path (internal/delta
+	// treats IsCounter=false rows as pass-through), so no rate derivation
+	// happens. buildRow's default label population handles the missing
+	// labels per the existing convention: ModelID resolves to "" (stored as
+	// the family's empty-string model_id, same as every other family that
+	// lacks a model_id label — no NULL special-casing is added).
+	"litellm_in_flight_requests": "in_flight",
 }
 
 // familyFor classifies a Prometheus metric name into a storage family.
@@ -289,6 +301,10 @@ func defaultUnit(family string) string {
 		return "usd"
 	case "limits":
 		return "ratio"
+	case "in_flight":
+		// Unlabeled gauge of concurrent in-flight HTTP requests; unitless
+		// request count, matching the requests family's unit.
+		return "count"
 	}
 	return ""
 }

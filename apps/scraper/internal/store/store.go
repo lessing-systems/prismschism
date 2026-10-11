@@ -55,6 +55,7 @@ var familyWhitelist = map[string]bool{
 	"limits":            true,
 	"deployment_health": true,
 	"counters":          true,
+	"in_flight":         true,
 }
 
 // PG implements Writer on top of database/sql with the pgx driver.
@@ -87,7 +88,7 @@ func (p *PG) WriteMetrics(ctx context.Context, rows []parser.Row) error {
 	byFamily := make(map[string][]parser.Row)
 	for _, r := range rows {
 		if !familyWhitelist[r.Family] {
-			return fmt.Errorf("write metrics: unknown family %q (allowed: input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, latency, requests, spend, limits, deployment_health, counters)", r.Family)
+			return fmt.Errorf("write metrics: unknown family %q (allowed: input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, latency, requests, spend, limits, deployment_health, counters, in_flight)", r.Family)
 		}
 		byFamily[r.Family] = append(byFamily[r.Family], r)
 	}
@@ -232,6 +233,19 @@ var familyColumns = map[string]familySchema{
 		columns: []string{"ts", "model_id", "exception_status", "value", "unit"},
 		values: func(r parser.Row) []any {
 			return []any{r.TS, r.ModelID, r.ExceptionStatus, r.Value, r.Unit}
+		},
+	},
+	// in_flight: litellm_in_flight_requests — a global, UNLABELED gauge of
+	// HTTP requests currently in flight on the LiteLLM worker. The parser
+	// emits ModelID "" for it (missing label → empty string per the existing
+	// buildRow convention, no NULL special-casing), so model_id is stored as
+	// the empty string, consistent with every other family that lacks a
+	// model_id label. IsCounter=false on the row, so the delta path keeps the
+	// raw gauge value untouched.
+	"in_flight": {
+		columns: []string{"ts", "model_id", "value", "unit"},
+		values: func(r parser.Row) []any {
+			return []any{r.TS, r.ModelID, r.Value, r.Unit}
 		},
 	},
 }
