@@ -21,7 +21,7 @@
 //     stats row (Avg Decode t/s, Input t/s, RPM), a "Requests" graph, and a
 //     "Decode token/s" graph whenever group=model decode data exists; then the
 //     errors-by-provider state-bar cards.
-//   * "Back-end Deployments" — the deployment side: ONE card per top deployment
+//   * "Model-Groups" — the deployment side: ONE card per top deployment
 //     group carrying the same stats row plus TWO stacked graphs, "Decode
 //     token/s" and "Input token/s".
 // Every card header carries the group's latest traffic-light state as a badge.
@@ -800,11 +800,11 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
         />
       </div>
 
-      {/* Back-end Deployments — the deployment side of the fleet: ONE card per
+      {/* Model-Groups — the deployment side of the fleet: ONE card per
           top deployment group, carrying both throughput graphs and the stats. */}
       <section data-testid="backend-section">
         <SectionHeader
-          title="Back-end Deployments"
+          title="Model-Groups"
           count={deploymentGroups.length}
           description="Deployment side · one row per model family, sorted by name"
           aside={

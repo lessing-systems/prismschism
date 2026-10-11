@@ -9,7 +9,7 @@
 // that only decorate existing cards. They stay unseeded unless a test asks for
 // them — the mock's unseeded default IS the "absent series" path.
 // It renders ONE card per top-N deployment group (selectTopGroups) inside its
-// single "Back-end Deployments" section (decode + input-token throughput per
+// single "Model-Groups" section (decode + input-token throughput per
 // deployment, ranked with deploymentLabel so labels take the composed
 // `model_id · litellm_model_name` form and can never be "unlabeled"). The
 // section header's right-aligned aside carries the deployment-group Legend,
@@ -352,7 +352,7 @@ describe('FleetMetricsPanel — single back-end section', () => {
     setErrors({ isLoading: false, isError: false, data: makeSeries(ERRORS_TOTALS) });
   }
 
-  it('renders a single "Back-end Deployments" section whose header carries the legend', () => {
+  it('renders a single "Model-Groups" section whose header carries the legend', () => {
     populated();
     render(<FleetMetricsPanel />);
 
@@ -360,7 +360,7 @@ describe('FleetMetricsPanel — single back-end section', () => {
     expect(screen.queryByTestId('frontend-section')).toBeNull();
     // One section, one header.
     expect(screen.getAllByTestId('backend-section')).toHaveLength(1);
-    expect(backendHeader()?.textContent).toBe('Back-end Deployments');
+    expect(backendHeader()?.textContent).toBe('Model-Groups');
     // The panel-level heading still sits above the section.
     expect(screen.getByText('Fleet Metrics')).toBeDefined();
 
@@ -455,7 +455,7 @@ describe('FleetMetricsPanel — single back-end section', () => {
     render(<FleetMetricsPanel />);
 
     expect(screen.queryByTestId('fleet-empty')).toBeNull();
-    expect(backendHeader()?.textContent).toBe('Back-end Deployments');
+    expect(backendHeader()?.textContent).toBe('Model-Groups');
     // An empty ranking series charts no deployment cards.
     expect(screen.queryAllByTestId('deployment-card')).toHaveLength(0);
     // The request side survives as the summary tile (its value is the count of
