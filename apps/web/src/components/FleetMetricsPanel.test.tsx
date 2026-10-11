@@ -8,11 +8,14 @@
 // plus three OPTIONAL series (decode/input by `model`, requests_per_min by `model_id`)
 // that only decorate existing cards. They stay unseeded unless a test asks for
 // them — the mock's unseeded default IS the "absent series" path.
-// It renders ONE card per top-N group (selectTopGroups) inside each of its two
-// stacked sections: "Front-end Models" (requests + errors + the requests
-// legend) and "Back-end Deployments" (decode + input-token throughput per
+// It renders ONE card per top-N deployment group (selectTopGroups) inside its
+// single "Back-end Deployments" section (decode + input-token throughput per
 // deployment, ranked with deploymentLabel so labels take the composed
-// `model_id · litellm_model_name` form and can never be "unlabeled").
+// `model_id · litellm_model_name` form and can never be "unlabeled"). The
+// section header's right-aligned aside carries the deployment-group Legend,
+// a hairline divider and the five-state StateLegend. The old front-end card
+// section is gone: the request side survives only as the "Model groups"
+// summary tile (and the still-gating requests/errors series).
 //
 // Two modules are mocked so the test is fully deterministic under jsdom:
 //   * `recharts`          — jsdom has no ResizeObserver, so ResponsiveContainer
@@ -77,7 +80,7 @@ vi.mock('@/lib/queries', () => ({
   useScrapeStatus: () => null,
 }));
 
-import { BACKEND_GRID, FleetMetricsPanel, FRONTEND_GRID } from '@/components/FleetMetricsPanel';
+import { BACKEND_GRID, FleetMetricsPanel } from '@/components/FleetMetricsPanel';
 import { ERROR_SENTINEL, type MetricPoint as MP } from '@/lib/types';
 
 // Fixture groups (production-shaped), with distinct totals so ranking is unique
@@ -134,12 +137,6 @@ const RANGE = '1h';
 // the degraded stats ("—") and the missing optional graph.
 function setPrefillDeployments(result: SeriesResult) {
   seriesState.byKey.set(keyFor('input_tps', '1h', 'model_id'), result);
-}
-function setDecodeByModel(result: SeriesResult) {
-  seriesState.byKey.set(keyFor('decode_tps', '1h', 'model'), result);
-}
-function setPrefillByModel(result: SeriesResult) {
-  seriesState.byKey.set(keyFor('input_tps', '1h', 'model'), result);
 }
 // Feeds the back-end card's "Req/min" stat, which now reads the dedicated
 // requests_per_min metric grouped by model_id.
@@ -198,24 +195,6 @@ const EXPECTED_TOP6_DEPLOYMENTS = [
   'unknown-deployment',
 ];
 
-// Expected top-6 requests groups (by total desc, alphabetical on the 350 tie).
-const EXPECTED_TOP6 = [
-  'Qwen3.8-27B-Q3_K_M.gguf',
-  'halogen-qwen3.8-flash-next',
-  'orchestration',
-  'tools',
-  'vision-tools',
-  'unlabeled', // "" group -> label "unlabeled"
-];
-const EXPECTED_TOP6_ERRORS = [
-  'None',
-  'openai',
-  'Qwen3.8-27B-Q3_K_M.gguf',
-  'orchestration',
-  'vision-tools',
-  'unlabeled',
-];
-
 function legendLabelOrder(): string[] {
   const legend = screen.getByTestId('fleet-legend');
   return Array.from(legend.children).map((el) => (el as HTMLElement).textContent ?? '');
@@ -234,42 +213,19 @@ beforeEach(() => {
 });
 
 describe('FleetMetricsPanel — dynamic top-N rendering', () => {
-  it('renders one card per top-N requests group, in top order', () => {
-    setRequests({ isLoading: false, isError: false, data: makeSeries(REQUESTS_TOTALS) });
-    setErrors({ isLoading: false, isError: false, data: makeSeries(ERRORS_TOTALS) });
-    const { container } = render(<FleetMetricsPanel />);
-
-    // Every expected top-6 requests group label is present in the cards.
-    for (const label of EXPECTED_TOP6) {
-      expect(container.textContent).toContain(`${label} · requests (1h)`);
-    }
-
-    // The legend lists the same groups, in the exact top order.
-    expect(legendLabelOrder()).toEqual(EXPECTED_TOP6);
-  });
-
-  it('renders the empty-string group as "unlabeled" in both labels and legend', () => {
-    setRequests({ isLoading: false, isError: false, data: makeSeries(REQUESTS_TOTALS) });
-    setErrors({ isLoading: false, isError: false, data: makeSeries(ERRORS_TOTALS) });
-    const { container } = render(<FleetMetricsPanel />);
-
-    // Card label for the "" group reads "unlabeled", never the raw empty string.
-    expect(container.textContent).toContain('unlabeled · requests (1h)');
-    expect(container.textContent).toContain('unlabeled · errors (1h)');
-    // Legend shows "unlabeled" and never a bare empty token.
-    expect(legendLabelOrder()).toContain('unlabeled');
-  });
-
-  it('legend (fleet-legend) lists the dynamic group names with a color swatch each', () => {
-    setRequests({ isLoading: false, isError: false, data: makeSeries(REQUESTS_TOTALS) });
-    setErrors({ isLoading: false, isError: false, data: makeSeries(ERRORS_TOTALS) });
-    const { container } = render(<FleetMetricsPanel />);
+  it('legend (fleet-legend) lists the deployment group labels in rank order with a color swatch each', () => {
+    // Deployments are seeded in beforeEach; the request side stays unseeded —
+    // the legend now reflects the DEPLOYMENT ranking, not the request side.
+    render(<FleetMetricsPanel />);
 
     const legend = screen.getByTestId('fleet-legend');
     expect(legend.getAttribute('role')).toBe('list');
 
     const items = Array.from(legend.children);
-    expect(items.length).toBe(EXPECTED_TOP6.length); // one entry per top group
+    // One entry per ranked deployment group, in exact rank order, capped at
+    // LEGEND_MAX (= 6) — the fixture has exactly six.
+    expect(items.length).toBe(EXPECTED_TOP6_DEPLOYMENTS.length);
+    expect(items.map((el) => el.textContent)).toEqual(EXPECTED_TOP6_DEPLOYMENTS);
     // Each legend entry carries a swatch cycling the six --legend-N tokens.
     items.forEach((el, i) => {
       const swatch = (el as HTMLElement).querySelector('[data-testid="legend-swatch"]');
@@ -278,12 +234,30 @@ describe('FleetMetricsPanel — dynamic top-N rendering', () => {
         `hsl(var(--legend-${(i % 6) + 1}))`,
       );
     });
-    void container;
+  });
+
+  it('legend and deployment-card swatches draw from the same six-colour cycle', () => {
+    // Cards are coloured by family-sorted display order while the legend follows
+    // rank order, but both draw swatches from the same --legend-1..6 cycle.
+    render(<FleetMetricsPanel />);
+
+    const legendColors = new Set(
+      Array.from(
+        screen.getByTestId('fleet-legend').querySelectorAll('[data-testid="legend-swatch"]'),
+      ).map((el) => (el as HTMLElement).style.backgroundColor),
+    );
+    const cardColors = new Set(
+      screen.getAllByTestId('deployment-card').map((card) => {
+        const swatch = card.querySelector<HTMLElement>('.h-3.w-1');
+        expect(swatch, 'card header swatch missing').not.toBeNull();
+        return swatch!.style.backgroundColor;
+      }),
+    );
+    expect([...cardColors].sort()).toEqual([...legendColors].sort());
   });
 
   it('contains NO hardcoded mock-era model names (gpt-4o / gpt-4-turbo)', () => {
-    setRequests({ isLoading: false, isError: false, data: makeSeries(REQUESTS_TOTALS) });
-    setErrors({ isLoading: false, isError: false, data: makeSeries(ERRORS_TOTALS) });
+    seedRequestSide();
     const { container } = render(<FleetMetricsPanel />);
     expect(container.textContent).not.toMatch(/gpt-4o|gpt-4-turbo/);
   });
@@ -293,6 +267,8 @@ describe('FleetMetricsPanel — sentinel exclusion feeds ranking', () => {
   it('excludes ERROR_SENTINEL points; a sentinel-only group is dropped (no slot, no legend entry)', () => {
     // 'real' = 100 (2x50). 'fake' = 4 sentinel points only (no real data).
     // If sentinels were counted, 'fake' would total 100 and steal a slot.
+    // Both groups are model_id-keyed deployment points; 'real' carries no
+    // litellm_model_name, so its label falls back to the bare model_id.
     const series: MP[] = [
       { t: 't1', group: 'real', value: 50 },
       { t: 't2', group: 'real', value: 50 },
@@ -301,8 +277,7 @@ describe('FleetMetricsPanel — sentinel exclusion feeds ranking', () => {
       { t: 't3', group: 'fake', value: ERROR_SENTINEL },
       { t: 't4', group: 'fake', value: ERROR_SENTINEL },
     ];
-    setRequests({ isLoading: false, isError: false, data: series });
-    setErrors({ isLoading: false, isError: false, data: [] });
+    setDeployments({ isLoading: false, isError: false, data: series });
     const { container } = render(<FleetMetricsPanel />);
 
     // 'real' is the ONLY group with real data -> the sole card + legend entry.
@@ -347,24 +322,21 @@ describe('FleetMetricsPanel — empty / error states', () => {
   });
 
   it('shows the destructive failure message (regression guard) when a series errors', () => {
-    setRequests({ isLoading: false, isError: true, data: undefined });
-    setErrors({ isLoading: false, isError: false, data: makeSeries(ERRORS_TOTALS) });
+    setDeployments({ isLoading: false, isError: true, data: undefined });
     const { container } = render(<FleetMetricsPanel />);
-    // The failing requests card shows the destructive text.
+    // The failing DEPLOYMENT series reports once for the whole series, in the
+    // section's error card — not per-group.
     const destructive = container.querySelector('.text-destructive');
     expect(destructive).not.toBeNull();
     expect((destructive as HTMLElement).textContent).toContain('Failed to load');
-    // A valid errors series still renders its cards alongside the failed one.
-    expect(container.textContent).toContain(`${EXPECTED_TOP6_ERRORS[0]} · errors (1h)`);
+    // A failed ranking series charts no deployment cards.
+    expect(screen.queryAllByTestId('deployment-card')).toHaveLength(0);
   });
 });
 
-describe('FleetMetricsPanel — two stacked sections', () => {
-  function sections() {
-    return {
-      frontend: screen.getByTestId('frontend-section'),
-      backend: screen.getByTestId('backend-section'),
-    };
+describe('FleetMetricsPanel — single back-end section', () => {
+  function backendHeader() {
+    return screen.getByTestId('backend-section').querySelector('h2');
   }
 
   function populated() {
@@ -372,29 +344,44 @@ describe('FleetMetricsPanel — two stacked sections', () => {
     setErrors({ isLoading: false, isError: false, data: makeSeries(ERRORS_TOTALS) });
   }
 
-  it('renders a front-end and a back-end section, front-end first in the DOM', () => {
+  it('renders a single "Back-end Deployments" section whose header carries the legend', () => {
     populated();
     render(<FleetMetricsPanel />);
 
-    const { frontend, backend } = sections();
-    expect(frontend.querySelector('h2')?.textContent).toBe('Model Groups');
-    expect(backend.querySelector('h2')?.textContent).toBe('Back-end Deployments');
-    // DOM order, not just presence: front-end precedes back-end.
-    expect(
-      frontend.compareDocumentPosition(backend) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    // The panel-level heading still sits above both sub-headers.
+    // The old front-end section is gone entirely.
+    expect(screen.queryByTestId('frontend-section')).toBeNull();
+    // One section, one header.
+    expect(screen.getAllByTestId('backend-section')).toHaveLength(1);
+    expect(backendHeader()?.textContent).toBe('Back-end Deployments');
+    // The panel-level heading still sits above the section.
     expect(screen.getByText('Fleet Metrics')).toBeDefined();
-    // The requests legend belongs to the front-end section.
-    expect(frontend.querySelector('[data-testid="fleet-legend"]')).not.toBeNull();
-    expect(backend.querySelector('[data-testid="fleet-legend"]')).toBeNull();
+
+    // The deployment legend lives INSIDE the back-end header (inverted from the
+    // old front-end placement).
+    const backend = screen.getByTestId('backend-section');
+    const legend = backend.querySelector('[data-testid="fleet-legend"]');
+    expect(legend).not.toBeNull();
+
+    // Aside order: Legend → hairline divider → StateLegend.
+    const aside = (legend as HTMLElement).parentElement as HTMLElement;
+    const divider = Array.from(aside.children).find(
+      (el) => el.classList.contains('h-px') && el.classList.contains('bg-border/40'),
+    );
+    expect(divider, 'divider missing between legend and state legend').not.toBeNull();
+    const stateLegend = Array.from(aside.children).find((el) =>
+      (el as HTMLElement).getAttribute('aria-label')?.startsWith('Traffic-light'),
+    );
+    expect(stateLegend, 'StateLegend missing from the header aside').not.toBeNull();
+    const kids = Array.from(aside.children);
+    expect(kids.indexOf(legend as Element)).toBeLessThan(kids.indexOf(divider as Element));
+    expect(kids.indexOf(divider as Element)).toBeLessThan(kids.indexOf(stateLegend as Element));
   });
 
   it('renders one deployment card per top group, sorted by family then model_id', () => {
     populated();
     render(<FleetMetricsPanel />);
 
-    const { backend, frontend } = sections();
+    const backend = screen.getByTestId('backend-section');
     const text = backend.textContent ?? '';
     // Ranking still decides WHICH groups appear; display order is family then
     // model_id, with the missing-model_id card (unknown-deployment) last.
@@ -419,15 +406,13 @@ describe('FleetMetricsPanel — two stacked sections', () => {
     const families = Array.from(backend.querySelectorAll('[data-testid="backend-family"]'));
     const famNames = families.map((f) => f.querySelector('h3')?.textContent ?? '');
     expect(famNames).toEqual(['legacy', 'orchestration', 'tools', 'vision', 'unknown']);
-    // Deployment cards live in the back-end section only.
-    expect(frontend.textContent).not.toContain('decode t/s (1h)');
   });
 
   it('labels deployment cards with the composed `model_id · litellm_model_name` form', () => {
     populated();
     render(<FleetMetricsPanel />);
 
-    const { backend } = sections();
+    const backend = screen.getByTestId('backend-section');
     expect(backend.textContent).toContain(
       'orchestration-qwen38 · halogen-qwen3.8-flash-next (1h)',
     );
@@ -437,33 +422,15 @@ describe('FleetMetricsPanel — two stacked sections', () => {
     expect(backend.textContent).not.toMatch(/·\s*·/);
   });
 
-  it('never renders "unlabeled" in the back-end section, even when the request side has one', () => {
+  it('never renders "unlabeled" in the back-end section', () => {
     populated();
     render(<FleetMetricsPanel />);
 
-    const { backend, frontend } = sections();
+    const backend = screen.getByTestId('backend-section');
     // The fixture deliberately includes an EMPTY model_id group; its fallback is
     // the deployment sentinel, never the request-side "unlabeled".
     expect(backend.textContent).not.toContain('unlabeled');
     expect(backend.textContent).toContain('unknown-deployment (1h)');
-    // Request-side "" -> "unlabeled" is unchanged and stays in the front-end section.
-    expect(frontend.textContent).toContain('unlabeled · requests (1h)');
-  });
-
-  it('isolates a deployment-series error to the back-end section', () => {
-    populated();
-    setDeployments({ isLoading: false, isError: true, data: undefined });
-    render(<FleetMetricsPanel />);
-
-    const { backend, frontend } = sections();
-    expect(backend.querySelector('.text-destructive')).not.toBeNull();
-    expect(backend.textContent).toContain('Failed to load');
-    // The front-end section is untouched by the deployment failure.
-    expect(frontend.querySelector('[data-testid="line-chart"]')).not.toBeNull();
-    expect(frontend.textContent).toContain(`${EXPECTED_TOP6[0]} · requests (1h)`);
-    expect(frontend.textContent).toContain(`${EXPECTED_TOP6_ERRORS[0]} · errors (1h)`);
-    // A failed series charts no deployment cards.
-    expect(screen.queryAllByTestId('deployment-card')).toHaveLength(0);
   });
 
   it('shows fleet-empty only when all three series resolved empty', () => {
@@ -474,18 +441,18 @@ describe('FleetMetricsPanel — two stacked sections', () => {
     expect(screen.getByTestId('fleet-empty').textContent).toBe('No data');
   });
 
-  it('keeps the front-end section intact when only the deployment series is empty', () => {
+  it('keeps the "Model groups" summary tile alive when the deployment series is empty', () => {
     populated();
     setDeployments({ isLoading: false, isError: false, data: [] });
     render(<FleetMetricsPanel />);
 
-    const { backend, frontend } = sections();
     expect(screen.queryByTestId('fleet-empty')).toBeNull();
-    expect(frontend.querySelector('[data-testid="line-chart"]')).not.toBeNull();
-    expect(frontend.textContent).toContain(`${EXPECTED_TOP6[0]} · requests (1h)`);
-    expect(backend.querySelector('h2')?.textContent).toBe('Back-end Deployments');
+    expect(backendHeader()?.textContent).toBe('Back-end Deployments');
     // An empty ranking series charts no deployment cards.
     expect(screen.queryAllByTestId('deployment-card')).toHaveLength(0);
+    // The request side survives as the summary tile (its value is the count of
+    // ranked request groups, fed by the still-gating requests series).
+    expect(screen.getByText('Model groups')).toBeDefined();
   });
 
   it('shows the panel skeleton while only the deployment series is loading', () => {
@@ -493,23 +460,37 @@ describe('FleetMetricsPanel — two stacked sections', () => {
     setDeployments({ isLoading: true, isError: false, data: undefined });
     const { container } = render(<FleetMetricsPanel />);
     expect(container.querySelector('.animate-pulse')).not.toBeNull();
-    expect(screen.queryByTestId('frontend-section')).toBeNull();
     expect(screen.queryByTestId('backend-section')).toBeNull();
   });
 
-  it('lays both sections out on the shared responsive card grid (1 → 2 → 3 → 4 columns)', () => {
+  it('lays the section out on the shared responsive card grid (1 → 2 → 3 → 4 columns)', () => {
     populated();
     render(<FleetMetricsPanel />);
-    const frontendGrid = document.querySelector('[data-testid="frontend-grid"]');
     const backendGrid = document.querySelector('[data-testid="backend-grid"]');
-    expect(frontendGrid).not.toBeNull();
     expect(backendGrid).not.toBeNull();
-    expect(frontendGrid?.className).toBe(FRONTEND_GRID);
     expect(backendGrid?.className).toBe(BACKEND_GRID);
-    expect(FRONTEND_GRID).toBe(
+    expect(BACKEND_GRID).toBe(
       'grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3 min-[2000px]:grid-cols-4',
     );
-    expect(BACKEND_GRID).toBe(FRONTEND_GRID);
+    // The deleted front-end grid left no trace.
+    expect(document.querySelector('[data-testid="frontend-grid"]')).toBeNull();
+  });
+
+  it('renders the five traffic-light states in the header StateLegend', () => {
+    populated();
+    render(<FleetMetricsPanel />);
+
+    const stateLegend = screen.getByRole('list', { name: 'Traffic-light states' });
+    const labels = Array.from(stateLegend.querySelectorAll('[role="img"]')).map((el) =>
+      el.getAttribute('aria-label'),
+    );
+    expect(labels).toEqual([
+      'Traffic light: healthy — output completed in the last few minutes',
+      'Traffic light: prefill — prefilling (approx)',
+      'Traffic light: error — request failed / upstream error / scrape down',
+      'Traffic light: idle — healthy but quiet',
+      'Traffic light: disabled — metric disabled',
+    ]);
   });
 });
 
@@ -527,9 +508,6 @@ function statValues(card: Element): string[] {
 }
 function backendSection(): HTMLElement {
   return screen.getByTestId('backend-section');
-}
-function frontendSection(): HTMLElement {
-  return screen.getByTestId('frontend-section');
 }
 function seedRequestSide() {
   setRequests({ isLoading: false, isError: false, data: makeSeries(REQUESTS_TOTALS) });
@@ -617,54 +595,6 @@ describe('FleetMetricsPanel — per-card stats', () => {
     // out. The input-token series is absent, so the middle stat reads 0; the
     // wall-clock series is absent, so the last stat reads "—".
     expect(statValues(card)).toEqual(['40', '0', '20', '\u2014']);
-  });
-});
-
-describe('FleetMetricsPanel — front-end card stats + optional decode graph', () => {
-  const TOP_MODEL = 'Qwen3.8-27B-Q3_K_M.gguf'; // top-ranked request-side group
-
-  it('stats row renders without the decode graph, then the graph appears', () => {
-    seedRequestSide();
-    // decode_tps|1h|model deliberately UNSEEDED (the dev mock never serves tps).
-    render(<FleetMetricsPanel />);
-
-    let frontend = frontendSection();
-    expect(frontend.querySelectorAll('[data-testid="card-stats"]').length).toBeGreaterThan(0);
-    // No group=model decode series -> no decode graph block anywhere in the
-    // front-end section, and the throughput stats fall back to "—".
-    expect(frontend.textContent).not.toContain('Decode token/s');
-    expect(frontend.textContent).toContain('Requests');
-    cleanup();
-
-    setDecodeByModel({
-      isLoading: false,
-      isError: false,
-      data: [
-        { t: 't1', group: TOP_MODEL, value: 10 },
-        { t: 't2', group: TOP_MODEL, value: 30 },
-      ],
-    });
-    setPrefillByModel({
-      isLoading: false,
-      isError: false,
-      data: [
-        { t: 't1', group: TOP_MODEL, value: 70 },
-        { t: 't2', group: TOP_MODEL, value: 80 },
-      ],
-    });
-    render(<FleetMetricsPanel />);
-
-    frontend = frontendSection();
-    expect(frontend.textContent).toContain('Decode token/s');
-    // First requests card == top-ranked model: decode mean 20, input mean 75,
-    // RPM = the request mean (250). The optional wall-clock series is absent,
-    // so the fourth stat reads "—".
-    const firstDls = frontend.querySelectorAll('[data-testid="card-stats"]');
-    expect(firstDls.length).toBeGreaterThan(0);
-    const values = Array.from(firstDls[0].querySelectorAll('dd')).map(
-      (el) => el.textContent ?? '',
-    );
-    expect(values).toEqual(['20', '75', '250', '\u2014']);
   });
 });
 
