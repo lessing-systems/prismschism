@@ -87,8 +87,8 @@ type Row struct {
 	// label; the source gauges are unlabeled, so it defaults to "" — stored as
 	// the backend_lanes table's empty-string backend per its NOT NULL DEFAULT
 	// ''). Every other family leaves it "" so their output is unchanged.
-	Backend string
-	APIProvider   string
+	Backend      string
+	APIProvider  string
 	Value        float64
 	Unit         string
 	HashedAPIKey string
@@ -483,13 +483,17 @@ func buildRow(labels []*dto.LabelPair, ts time.Time, family string, name string,
 // valueToStatus normalises the litellm_deployment_state gauge value into the
 // closed status vocabulary stored in deployment_health.status.
 //
-// Caller decision: 0 -> "healthy"; every non-zero value (1 = partial outage,
-// 2 = under maintenance) collapses to "error". The dashboard only
-// distinguishes healthy from not-healthy, so "prefill", "partial" and "down"
-// are NEVER emitted by the scraper.
+// Caller decision: 0 -> "healthy"; 1 (partial outage) -> "prefill" — a partial
+// outage still serves traffic, and the API's closed state set (STATE_RANK in
+// apps/api/src/server.ts) has no "disabled" state, so maintenance (2) also maps
+// to "prefill" rather than the false-red "error". Any other value -> "error".
+// "error" is reserved for states the scraper cannot interpret.
 func valueToStatus(v float64) string {
 	if v == 0 {
 		return "healthy"
+	}
+	if v == 1 || v == 2 {
+		return "prefill"
 	}
 	return "error"
 }

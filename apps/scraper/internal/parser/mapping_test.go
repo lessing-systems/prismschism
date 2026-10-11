@@ -390,8 +390,8 @@ func TestParseSampleFile(t *testing.T) {
 	if statuses["halogen-qwen3.8-flash-next"] != "healthy" {
 		t.Errorf("halogen-qwen3.8-flash-next status = %q, want \"healthy\" (gauge 0.0)", statuses["halogen-qwen3.8-flash-next"])
 	}
-	if statuses["orchestration"] != "error" {
-		t.Errorf("orchestration status = %q, want \"error\" (gauge 2.0)", statuses["orchestration"])
+	if statuses["orchestration"] != "prefill" {
+		t.Errorf("orchestration status = %q, want \"prefill\" (gauge 2.0, maintenance)", statuses["orchestration"])
 	}
 }
 
@@ -533,15 +533,19 @@ func TestDeploymentStateCompositeKey(t *testing.T) {
 		t.Errorf("SeriesKey() must not carry a status label: %q", a.SeriesKey())
 	}
 
-	// Caller decision: 0 -> healthy; every non-zero -> error.
+	// Caller decision: 0 -> healthy; 1 (partial) and 2 (maintenance) -> prefill
+	// (no false "error"; the API has no "disabled" state); anything else -> error.
 	if got := valueToStatus(0); got != "healthy" {
 		t.Errorf("valueToStatus(0) = %q, want \"healthy\"", got)
 	}
-	if got := valueToStatus(1); got != "error" {
-		t.Errorf("valueToStatus(1) = %q, want \"error\"", got)
+	if got := valueToStatus(1); got != "prefill" {
+		t.Errorf("valueToStatus(1) = %q, want \"prefill\"", got)
 	}
-	if got := valueToStatus(2); got != "error" {
-		t.Errorf("valueToStatus(2) = %q, want \"error\"", got)
+	if got := valueToStatus(2); got != "prefill" {
+		t.Errorf("valueToStatus(2) = %q, want \"prefill\"", got)
+	}
+	if got := valueToStatus(3); got != "error" {
+		t.Errorf("valueToStatus(3) = %q, want \"error\"", got)
 	}
 }
 
