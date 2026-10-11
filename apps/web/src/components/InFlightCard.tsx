@@ -2,7 +2,9 @@
 // (useInflight, 15s refetch). The gauge degrades to { ts: null, value: null }
 // — with a 200 — while the in_flight table is missing, and reads the same
 // shape with no sample yet; both null cases render the EMPTY_STAT em-dash
-// plus a "no sample yet" hint rather than a 0.
+// plus a "no sample yet" hint rather than a 0. Backend lanes (running/max,
+// tabular-nums, em-dash when either is null) list under the sessions block
+// and are hidden entirely while `backends` is empty (pre-migration 010).
 import { useEffect, useState } from 'react';
 import { useInflight } from '@/lib/queries';
 import { formatStat } from '@/lib/stats';
@@ -45,7 +47,7 @@ export function InFlightCard({ windowMinutes }: { windowMinutes?: number }) {
     );
   }
 
-  const { inflight, sessions } = query.data;
+  const { inflight, sessions, backends } = query.data;
   const ago = inflight.ts ? Math.max(0, Math.round((now - Date.parse(inflight.ts)) / 1000)) : null;
 
   return (
@@ -87,6 +89,32 @@ export function InFlightCard({ windowMinutes }: { windowMinutes?: number }) {
             </li>
           ))}
         </ul>
+      )}
+
+      {backends.length > 0 && (
+        <div data-testid="backends-section" className="mt-4">
+          <div className="text-xs text-muted-foreground">Backends</div>
+          <ul className="mt-1 divide-y divide-border text-xs">
+            {backends.map((b) => (
+              <li key={b.backend} className="flex items-center justify-between gap-3 py-1.5">
+                <span className="truncate font-mono text-muted-foreground" title={b.backend}>
+                  {b.backend}
+                </span>
+                <span className="flex shrink-0 items-center gap-2">
+                  <span className="tabular-nums text-foreground">
+                    {b.running === null || b.max === null ? '\u2014' : `${b.running}/${b.max}`}
+                  </span>
+                  {typeof b.waiting === 'number' && b.waiting > 0 && (
+                    <span className="tabular-nums text-destructive">+{b.waiting} waiting</span>
+                  )}
+                  {b.waiting === 0 && (
+                    <span className="tabular-nums text-muted-foreground">0 waiting</span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );

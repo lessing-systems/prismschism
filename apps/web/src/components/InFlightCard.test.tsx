@@ -1,5 +1,6 @@
 // Contract tests for the InFlightCard: gauge value, null-gauge placeholder
-// (missing table / no sample yet), and the distinct-sessions byModel rows.
+// (missing table / no sample yet), distinct-sessions byModel rows, and the
+// backend lanes (running/max, waiting highlight, pre-migration absence).
 // Harness style follows FleetMetricsPanel.debug.test.tsx — mock the hook
 // module, render, assert on DOM text.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -32,6 +33,10 @@ function sample(overrides: Partial<InflightResponse> = {}): InflightResponse {
         { modelId: 'kimi-k2', distinct: 8 },
       ],
     },
+    backends: [
+      { backend: 'glm', running: 4, waiting: 0, max: 8 },
+      { backend: 'kimi', running: 1, waiting: 0, max: 4 },
+    ],
     ...overrides,
   };
 }
@@ -69,8 +74,9 @@ describe('InFlightCard', () => {
     expect(card.textContent).toContain('distinct sessions (15m)');
     expect(screen.getByText('glm-4.6').textContent).toBe('glm-4.6');
     expect(screen.getByText('kimi-k2').textContent).toBe('kimi-k2');
-    // Each row carries its distinct count next to the model id.
-    const rows = screen.getByRole('list').querySelectorAll('li');
+    // Each row carries its distinct count next to the model id. (First list:
+    // the second one is the backends section.)
+    const rows = screen.getAllByRole('list')[0].querySelectorAll('li');
     expect(rows.length).toBe(2);
     expect(rows[0].textContent).toContain('12');
     expect(rows[1].textContent).toContain('8');
@@ -80,5 +86,41 @@ describe('InFlightCard', () => {
     state.isError = true;
     render(<InFlightCard />);
     expect(screen.getByTestId('in-flight-card').textContent).toContain('Failed to load');
+  });
+
+  it('renders each backend lane as running/max and highlights waiting > 0 in the destructive style', () => {
+    state.inflight = sample({
+      backends: [{ backend: 'glm', running: 4, waiting: 2, max: 8 }],
+    });
+    render(<InFlightCard />);
+    expect(screen.getByTestId('backends-section').textContent).toContain('4/8');
+    const waiting = screen.getByText('+2 waiting');
+    expect(waiting.className).toContain('text-destructive');
+  });
+
+  it('renders a muted "0 waiting" all-clear when the waiting count is zero', () => {
+    state.inflight = sample({
+      backends: [{ backend: 'glm', running: 4, waiting: 0, max: 8 }],
+    });
+    render(<InFlightCard />);
+    const waiting = screen.getByText('0 waiting');
+    expect(waiting.className).toContain('text-muted-foreground');
+  });
+
+  it('hides the backends section entirely when backends is empty (pre-migration)', () => {
+    state.inflight = sample({ backends: [] });
+    render(<InFlightCard />);
+    expect(screen.queryByTestId('backends-section')).toBeNull();
+  });
+
+  it('renders the em-dash placeholder for lanes when running/max are null', () => {
+    state.inflight = sample({
+      backends: [{ backend: 'glm', running: null, waiting: null, max: null }],
+    });
+    render(<InFlightCard />);
+    const section = screen.getByTestId('backends-section');
+    expect(section.textContent).toContain('glm');
+    expect(section.textContent).toContain('\u2014');
+    expect(section.textContent).not.toContain('waiting');
   });
 });
