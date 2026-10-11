@@ -4,6 +4,7 @@ import { useSyncExternalStore } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   fetchBreakdown,
+  fetchInflight,
   fetchKpis,
   fetchSeries,
   getScrapeStatus,
@@ -34,6 +35,14 @@ export function useBreakdown(metric: Metric, range: Range) {
   return useQuery({
     queryKey: ["breakdown", metric, range],
     queryFn: () => fetchBreakdown(metric, range),
+    refetchInterval: REFETCH_INTERVAL,
+  });
+}
+
+export function useInflight(windowMinutes?: number) {
+  return useQuery({
+    queryKey: ["inflight", windowMinutes],
+    queryFn: () => fetchInflight(windowMinutes),
     refetchInterval: REFETCH_INTERVAL,
   });
 }
