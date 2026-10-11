@@ -1713,6 +1713,193 @@ export function toBreakdown(rows: readonly BreakdownRow[]): BreakdownItem[] {
   return items;
 }
 
+// ===========================================================================
+// GET /api/inflight — the in-flight gauge + distinct active sessions
+// ===========================================================================
+
+/** /api/inflight window bounds: the look-back for the distinct-sessions
+ *  queries is `windowMinutes`, optional (default 15) and clamped to [1, 1440]
+ *  (one minute .. one day). */
+export const DEFAULT_INFLIGHT_WINDOW_MINUTES = 15;
+export const INFLIGHT_WINDOW_MIN_MINUTES = 1;
+export const INFLIGHT_WINDOW_MAX_MINUTES = 1440;
+
+/** The single row `buildInflightSql` emits: the latest `in_flight` scrape.
+ *  pg hands `ts` back as a Date (timestamptz) and `value` as text or null. */
+export interface InflightRow {
+  ts?: unknown;
+  value?: unknown;
+  unit?: unknown;
+}
+
+/** One `buildInflightSessionsByModelSql` row: a model_id group and its
+ *  distinct-identity-tuple count (aliased `distinct_count`). */
+export interface InflightSessionsRow {
+  model_id?: unknown;
+  distinct_count?: unknown;
+}
+
+/** The single row `buildInflightSessionsTotalSql` emits. */
+export interface InflightTotalRow {
+  distinct_total?: unknown;
+}
+
+/** The latest in_flight row. No parameters — always the newest scrape,
+ *  exactly the gauge reading the scraper last wrote. */
+export function buildInflightSql(): string {
+  return `SELECT ts, value, unit FROM in_flight ORDER BY ts DESC LIMIT 1`;
+}
+
+/** The distinct active identity tuples from `requests` within the window.
+ *  The window is bound as `$1` in MINUTES (unlike the seconds everywhere
+ *  else, this endpoint's contract is minutes). The row constructor
+ *  `("user", api_key_alias, team)` is count-distinct'd: Postgres compares
+ *  row values component-wise, so NULL components neither collapse distinct
+ *  identities into one nor crash the aggregate. Nothing is interpolated. */
+export function buildInflightSessionsTotalSql(): string {
+  return (
+    `SELECT COUNT(DISTINCT ("user", api_key_alias, team)) AS distinct_total FROM requests ` +
+    `WHERE ts >= now() - ($1 * interval '1 minute')`
+  );
+}
+
+/** The same distinct-identity count grouped by model_id, top 8 by count
+ *  descending — the per-model axis of the sessions card. */
+export function buildInflightSessionsByModelSql(): string {
+  return (
+    `SELECT model_id, COUNT(DISTINCT ("user", api_key_alias, team)) AS distinct_count FROM requests ` +
+    `WHERE ts >= now() - ($1 * interval '1 minute') ` +
+    `GROUP BY model_id ORDER BY distinct_count DESC LIMIT 8`
+  );
+}
+
+/** True when the error is pg's 42P01 (undefined_table) — the shape the
+ *  /api/inflight handler tolerates for the not-yet-migrated `in_flight`
+ *  table (deploy order: API before migration). */
+export function isPgUndefinedTable(err: unknown): boolean {
+  return (err as { code?: unknown } | null | undefined)?.code === "42P01";
+}
+
+/** A finished in-flight gauge — the `inflight` field of the /api/inflight
+ *  contract. A missing row (or a failed/unmigrated in_flight table) is
+ *  `{ ts: null, value: null, unit: "count" }`: the gauge is a point-in-time
+ *  reading, and "no reading" must stay null, never a fabricated 0. */
+export interface InflightGauge {
+  ts: string | null;
+  value: number | null;
+  unit: string;
+}
+
+/** One row (or none) -> the gauge field. `ts` is ISO-8601 or null; a null
+ *  storage value stays null; a non-numeric value is treated as no reading. */
+export function toInflight(row: InflightRow | null | undefined): InflightGauge {
+  if (row === null || row === undefined) {
+    return { ts: null, value: null, unit: "count" };
+  }
+  let ts: string | null = null;
+  if (row.ts !== null && row.ts !== undefined) {
+    const ms = row.ts instanceof Date ? row.ts.getTime() : Date.parse(String(row.ts));
+    if (Number.isFinite(ms)) ts = new Date(ms).toISOString();
+  }
+  let value: number | null = null;
+  if (row.value !== null && row.value !== undefined) {
+    const n = Number(row.value);
+    if (Number.isFinite(n)) value = n;
+  }
+  const unit = row.unit === null || row.unit === undefined ? "count" : String(row.unit);
+  return { ts, value, unit };
+}
+
+/** A finished byModel entry — matches the contract's byModel items exactly. */
+export interface InflightModelGroup {
+  modelId: string;
+  distinct: number;
+}
+
+/** Sessions byModel rows -> `[{ modelId, distinct }]`. A null model_id group
+ *  becomes "(unknown)" (the convention the breakdown handler already uses);
+ *  a non-numeric count degrades to 0. Sorted by distinct descending with ties
+ *  broken by modelId ascending, so the payload is deterministic even though
+ *  the SQL already orders it. */
+export function toInflightModelGroups(rows: readonly InflightSessionsRow[]): InflightModelGroup[] {
+  const groups = rows.map((row) => {
+    const raw = row.model_id;
+    const modelId = raw === null || raw === undefined ? "(unknown)" : String(raw);
+    const n = Number(row.distinct_count);
+    return { modelId, distinct: Number.isFinite(n) ? n : 0 };
+  });
+  groups.sort((a, b) => {
+    if (b.distinct !== a.distinct) return b.distinct - a.distinct;
+    return a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0;
+  });
+  return groups;
+}
+
+/** GET /api/inflight?windowMinutes=15 -> the in-flight gauge plus the
+ *  distinct active identity tuples within the window.
+ *
+ *  Robustness for deploy order: if the in_flight query fails with pg's 42P01
+ *  (undefined_table — migration 009 not applied yet), the gauge degrades to
+ *  `{ ts: null, value: null }` and the response is still 200; the sessions
+ *  queries never touch in_flight and must always work. Any OTHER query
+ *  failure is a 500, as in every other handler here. */
+function handleInflight(query: QueryFn, params: URLSearchParams, res: ServerResponse): void {
+  const raw = params.get("windowMinutes");
+  let windowMinutes = DEFAULT_INFLIGHT_WINDOW_MINUTES;
+  if (raw !== null && raw.trim() !== "") {
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+      sendJson(res, 400, { error: "invalid windowMinutes" });
+      return;
+    }
+    windowMinutes = Math.min(
+      INFLIGHT_WINDOW_MAX_MINUTES,
+      Math.max(INFLIGHT_WINDOW_MIN_MINUTES, Math.floor(parsed))
+    );
+  }
+
+  // The gauge query: 42P01 (migration not yet applied) degrades to a null
+  // gauge, exactly the failure-tolerance shape /api/kpis uses per field.
+  const inflightRow: Promise<InflightRow | null> = query(buildInflightSql(), [])
+    .then((result) => (result.rows[0] ?? null) as InflightRow | null)
+    .catch((err: unknown) => {
+      if (isPgUndefinedTable(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn("in_flight table missing (migration 009 not applied); emitting null inflight:", message);
+        return null;
+      }
+      throw err;
+    });
+
+  const totalRow: Promise<InflightTotalRow | undefined> = query(
+    buildInflightSessionsTotalSql(),
+    [windowMinutes]
+  ).then((result) => result.rows[0] as InflightTotalRow | undefined);
+
+  const byModelRows: Promise<InflightSessionsRow[]> = query(
+    buildInflightSessionsByModelSql(),
+    [windowMinutes]
+  ).then((result) => result.rows as InflightSessionsRow[]);
+
+  Promise.all([inflightRow, totalRow, byModelRows])
+    .then(([row, total, groups]) => {
+      const n = Number(total?.distinct_total);
+      sendJson(res, 200, {
+        inflight: toInflight(row),
+        sessions: {
+          windowMinutes,
+          distinctTotal: Number.isFinite(n) ? n : 0,
+          byModel: toInflightModelGroups(groups),
+        },
+      });
+    })
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("inflight query failed:", message);
+      sendJson(res, 500, { error: "internal error" });
+    });
+}
+
 /** GET /api/kpis?range= -> the six contract fields, ALL keys always present.
  *
  *  `error_rate` and `p95_ms` have NO data source in this database (verified
@@ -1838,8 +2025,8 @@ function handleBreakdown(query: QueryFn, params: URLSearchParams, res: ServerRes
 }
 
 /** Build the single `node:http` request handler. `createServer(handler)` yields
- *  a ready server. GET /api/series, /api/kpis and /api/breakdown are
- *  implemented; every other request is a 404. */
+ *  a ready server. GET /api/series, /api/kpis, /api/breakdown and
+ *  /api/inflight are implemented; every other request is a 404. */
 export function createRequestHandler(deps: HandlerDeps): (req: IncomingMessage, res: ServerResponse) => void {
   const { query } = deps;
 
@@ -1860,6 +2047,10 @@ export function createRequestHandler(deps: HandlerDeps): (req: IncomingMessage, 
     }
     if (url.pathname === "/api/breakdown") {
       handleBreakdown(query, url.searchParams, res);
+      return;
+    }
+    if (url.pathname === "/api/inflight") {
+      handleInflight(query, url.searchParams, res);
       return;
     }
     if (url.pathname !== "/api/series") {

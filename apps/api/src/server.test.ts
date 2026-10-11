@@ -2774,3 +2774,152 @@ describe('server.ts source guard — kpis/breakdown surface', () => {
     expect(src).toContain('p95_ms: null');
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /api/inflight — integration (in-flight gauge + distinct sessions)
+// ---------------------------------------------------------------------------
+
+/** GET `${base}/api/inflight?${qs}` and return status + parsed JSON body. */
+async function getInflight(base: string, qs: string): Promise<{ status: number; body: any }> {
+  const res = await fetch(`${base}/api/inflight?${qs}`);
+  const body = await res.json();
+  return { status: res.status, body };
+}
+
+/**
+ * A `vi.fn()` fake `QueryFn` for /api/inflight, which issues THREE queries
+ * (the latest `in_flight` row, the distinct-total row, and the per-model
+ * groups). It dispatches on the SQL text so each query can be canned
+ * independently; `fail` names one query that rejects with a pg-style error
+ * carrying `code` (42P01 = undefined_table) to pin the missing-table tolerance.
+ */
+function makeInflightQuery(spec: {
+  inflight?: any[];
+  total?: any[];
+  byModel?: any[];
+  fail?: 'inflight' | 'total' | 'byModel';
+  code?: string;
+}): FakeQuery {
+  return vi.fn(async (sql: string) => {
+    const which: 'inflight' | 'total' | 'byModel' = sql.includes('FROM in_flight')
+      ? 'inflight'
+      : sql.includes('distinct_count')
+        ? 'byModel'
+        : 'total';
+    if (spec.fail === which) {
+      const err = new Error(`injected failure: ${which}`);
+      if (spec.code) (err as any).code = spec.code;
+      throw err;
+    }
+    return { rows: (spec[which] ?? []) as any[] };
+  }) as unknown as FakeQuery;
+}
+
+describe('GET /api/inflight — integration', () => {
+  it('serves the contract shape and binds the default 15-minute window', async () => {
+    const q = makeInflightQuery({
+      inflight: [{ ts: '2026-10-11T00:00:00.000Z', value: '7', unit: 'count' }],
+      total: [{ distinct_total: '3' }],
+      byModel: [
+        { model_id: 'gpt-4', distinct_count: '2' },
+        { model_id: 'llama', distinct_count: '1' },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, '');
+      expect(status).toBe(200);
+      expect(body).toEqual({
+        inflight: { ts: '2026-10-11T00:00:00.000Z', value: 7, unit: 'count' },
+        sessions: {
+          windowMinutes: 15,
+          distinctTotal: 3,
+          byModel: [
+            { modelId: 'gpt-4', distinct: 2 },
+            { modelId: 'llama', distinct: 1 },
+          ],
+        },
+      });
+      expect(q).toHaveBeenCalledTimes(3);
+      // The gauge query binds nothing; the two session queries bind the window
+      // in MINUTES and count-distinct the identity row constructor.
+      const sqls = q.mock.calls.map((c) => String(c[0]));
+      expect(sqls.filter((s) => s.includes('FROM in_flight'))).toHaveLength(1);
+      expect(sqls.filter((s) => s.includes('COUNT(DISTINCT ("user", api_key_alias, team))'))).toHaveLength(2);
+      for (const call of q.mock.calls) {
+        if (String(call[0]).includes('FROM in_flight')) expect(call[1]).toEqual([]);
+        else expect(call[1]).toEqual([15]);
+      }
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('tolerates a missing in_flight table (42P01): 200 with null inflight and live sessions', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeInflightQuery({
+      fail: 'inflight',
+      code: '42P01',
+      total: [{ distinct_total: '5' }],
+      byModel: [{ model_id: 'gpt-4', distinct_count: '5' }],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, 'windowMinutes=60');
+      expect(status).toBe(200);
+      expect(body.inflight).toEqual({ ts: null, value: null, unit: 'count' });
+      expect(body.sessions).toEqual({
+        windowMinutes: 60,
+        distinctTotal: 5,
+        byModel: [{ modelId: 'gpt-4', distinct: 5 }],
+      });
+      expect(q).toHaveBeenCalledTimes(3);
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('in_flight table missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await srv.close();
+    }
+  });
+
+  it('clamps windowMinutes into [1, 1440] and 400s a non-numeric value without querying', async () => {
+    const q = makeInflightQuery({ inflight: [], total: [{ distinct_total: '0' }], byModel: [] });
+    const srv = await startServer(q);
+    try {
+      const bad = await getInflight(srv.base, 'windowMinutes=abc');
+      expect(bad.status).toBe(400);
+      expect(typeof bad.body.error).toBe('string');
+      expect(q).not.toHaveBeenCalled();
+
+      for (const [raw, bound] of [
+        ['0', 1],
+        ['-5', 1],
+        ['99999', 1440],
+        ['30', 30],
+      ] as const) {
+        (q as any).mockClear();
+        const { status, body } = await getInflight(srv.base, `windowMinutes=${raw}`);
+        expect(status).toBe(200);
+        expect(body.sessions.windowMinutes).toBe(bound);
+        for (const call of q.mock.calls) {
+          if (!String(call[0]).includes('FROM in_flight')) expect(call[1]).toEqual([bound]);
+        }
+      }
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('emits a null gauge (not a fabricated 0) when in_flight has no row yet', async () => {
+    const q = makeInflightQuery({ inflight: [], total: [{ distinct_total: '1' }], byModel: [] });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.inflight).toEqual({ ts: null, value: null, unit: 'count' });
+      expect(body.sessions.distinctTotal).toBe(1);
+    } finally {
+      await srv.close();
+    }
+  });
+});
