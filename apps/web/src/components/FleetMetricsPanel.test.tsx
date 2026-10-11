@@ -82,6 +82,7 @@ vi.mock('@/lib/queries', () => ({
 
 import { BACKEND_GRID, FleetMetricsPanel } from '@/components/FleetMetricsPanel';
 import { ERROR_SENTINEL, type MetricPoint as MP } from '@/lib/types';
+import { LEGEND_MAX } from '@/lib/topGroups';
 
 // Fixture groups (production-shaped), with distinct totals so ranking is unique
 // except for the intended orchestration/halogen tie (alphabetical tie-break).
@@ -185,13 +186,15 @@ const DEPLOYMENTS: DeploymentFixture[] = [
   { modelId: '', name: 'orphaned-name', total: 100 },
 ];
 
-// Expected top-6 deployment card labels, ranked by decode total descending.
+// Expected top-6 deployment labels in RENDER order (families sorted
+// alphabetically, groups sorted within each family, unassigned last) — the
+// order shared by the card grid and the legend via swatchGroups.
 const EXPECTED_TOP6_DEPLOYMENTS = [
+  'legacy-no-name',
   'orchestration-qwen38 · halogen-qwen3.8-flash-next',
   'orchestration-qwen38-b · halogen-qwen3.8-flash-next',
-  'vision-tools-4b · vision-tools-qwen3-vl',
   'tools-moe · tools-moe-a3b',
-  'legacy-no-name',
+  'vision-tools-4b · vision-tools-qwen3-vl',
   'unknown-deployment',
 ];
 
@@ -213,16 +216,17 @@ beforeEach(() => {
 });
 
 describe('FleetMetricsPanel — dynamic top-N rendering', () => {
-  it('legend (fleet-legend) lists the deployment group labels in rank order with a color swatch each', () => {
+  it('legend (fleet-legend) lists the deployment group labels in render order with a color swatch each', () => {
     // Deployments are seeded in beforeEach; the request side stays unseeded —
-    // the legend now reflects the DEPLOYMENT ranking, not the request side.
+    // the legend now reflects the shared swatchGroups RENDER order (family-
+    // sorted), not the raw rank order.
     render(<FleetMetricsPanel />);
 
     const legend = screen.getByTestId('fleet-legend');
     expect(legend.getAttribute('role')).toBe('list');
 
     const items = Array.from(legend.children);
-    // One entry per ranked deployment group, in exact rank order, capped at
+    // One entry per deployment group, in exact render order, capped at
     // LEGEND_MAX (= 6) — the fixture has exactly six.
     expect(items.length).toBe(EXPECTED_TOP6_DEPLOYMENTS.length);
     expect(items.map((el) => el.textContent)).toEqual(EXPECTED_TOP6_DEPLOYMENTS);
@@ -236,24 +240,28 @@ describe('FleetMetricsPanel — dynamic top-N rendering', () => {
     });
   });
 
-  it('legend and deployment-card swatches draw from the same six-colour cycle', () => {
-    // Cards are coloured by family-sorted display order while the legend follows
-    // rank order, but both draw swatches from the same --legend-1..6 cycle.
+  it('legend chips and deployment-card swatches match colour-for-colour in render order', () => {
+    // Cards and the legend now share ONE order: swatchGroups (the family-sorted
+    // render list). For the first min(LEGEND_MAX, N) deployments in render
+    // order, the card's swatch and its legend chip must carry the SAME
+    // --legend-N token — a legend that does not match its cards is broken.
     render(<FleetMetricsPanel />);
 
-    const legendColors = new Set(
-      Array.from(
-        screen.getByTestId('fleet-legend').querySelectorAll('[data-testid="legend-swatch"]'),
-      ).map((el) => (el as HTMLElement).style.backgroundColor),
+    const chips = Array.from(
+      screen.getByTestId('fleet-legend').querySelectorAll('[data-testid="legend-swatch"]'),
     );
-    const cardColors = new Set(
-      screen.getAllByTestId('deployment-card').map((card) => {
-        const swatch = card.querySelector<HTMLElement>('.h-3.w-1');
-        expect(swatch, 'card header swatch missing').not.toBeNull();
-        return swatch!.style.backgroundColor;
-      }),
-    );
-    expect([...cardColors].sort()).toEqual([...legendColors].sort());
+    // Cards in document order == render order (family rows in sorted sequence).
+    const cards = screen.getAllByTestId('deployment-card');
+    expect(chips.length).toBe(Math.min(LEGEND_MAX, cards.length));
+
+    chips.forEach((chip, i) => {
+      const swatch = cards[i].querySelector<HTMLElement>('.h-3.w-1');
+      expect(swatch, `card header swatch missing at render position ${i}`).not.toBeNull();
+      expect((chip as HTMLElement).style.backgroundColor).toBe(
+        `hsl(var(--legend-${(i % 6) + 1}))`,
+      );
+      expect(swatch!.style.backgroundColor).toBe((chip as HTMLElement).style.backgroundColor);
+    });
   });
 
   it('contains NO hardcoded mock-era model names (gpt-4o / gpt-4-turbo)', () => {

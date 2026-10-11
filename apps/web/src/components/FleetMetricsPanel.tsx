@@ -727,6 +727,13 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
     deploymentPoints,
   );
 
+  // Single source of truth for swatch colour order: the exact list the card
+  // grid renders, flattened in render order (families sorted, then groups
+  // sorted within each family). Cards look their colour up by index here and
+  // the legend slices the same array, so a chip always matches its card.
+  const swatchGroups = groupByFamily(deploymentGroups).flatMap((fam) => fam.groups);
+  const swatchIndex = new Map(swatchGroups.map((g, i) => [g.group, i]));
+
   // Empty only when every GATING series resolved without error and produced no
   // groups. The input-token rate is a secondary graph on the same cards, so it must
   // not gate emptiness (neither do the optional per-model / per-deployment series).
@@ -805,7 +812,7 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
               {/* The legend scale has exactly six distinct colours, so it stays
                   capped at LEGEND_MAX entries even though up to PANEL_TOP_N cards
                   are rendered. */}
-              <Legend groups={deploymentGroups.slice(0, LEGEND_MAX)} />
+              <Legend groups={swatchGroups.slice(0, LEGEND_MAX)} />
               <div aria-hidden="true" className="h-px w-full bg-border/40" />
               <StateLegend />
             </div>
@@ -820,37 +827,35 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
           </div>
         ) : (
           // One row per family (model_id prefix), families and cards sorted by
-          // name. Colours follow the sorted order so they read left-to-right.
+          // name. Colours follow swatchGroups (the render-order list) so each
+          // card's swatch matches its legend chip.
           <div className="flex flex-col gap-6">
-            {(() => {
-              let colour = 0;
-              return groupByFamily(deploymentGroups).map((fam) => (
-                <div key={fam.family} data-testid="backend-family">
-                  <div className="mb-2 flex items-center gap-2">
-                    <h3 className="eyebrow">{fam.family || "unknown"}</h3>
-                    <span className="text-[11px] tabular-nums text-muted-foreground/70">
-                      {fam.groups.length}
-                    </span>
-                    <span aria-hidden="true" className="h-px flex-1 bg-border/70" />
-                  </div>
-                  <div data-testid="backend-grid" className={BACKEND_GRID}>
-                    {fam.groups.map((g) => (
-                      <DeploymentCard
-                        key={`decode_tps:${g.group}`}
-                        label={g.label}
-                        group={g.group}
-                        seriesIndex={colour++}
-                        range={range}
-                        decode={decodeByDeployment}
-                        input={inputByDeployment}
-                        rpm={rpmByDeployment}
-                        wallClock={wallClockByDeployment}
-                      />
-                    ))}
-                  </div>
+            {groupByFamily(deploymentGroups).map((fam) => (
+              <div key={fam.family} data-testid="backend-family">
+                <div className="mb-2 flex items-center gap-2">
+                  <h3 className="eyebrow">{fam.family || "unknown"}</h3>
+                  <span className="text-[11px] tabular-nums text-muted-foreground/70">
+                    {fam.groups.length}
+                  </span>
+                  <span aria-hidden="true" className="h-px flex-1 bg-border/70" />
                 </div>
-              ));
-            })()}
+                <div data-testid="backend-grid" className={BACKEND_GRID}>
+                  {fam.groups.map((g) => (
+                    <DeploymentCard
+                      key={`decode_tps:${g.group}`}
+                      label={g.label}
+                      group={g.group}
+                      seriesIndex={swatchIndex.get(g.group) ?? 0}
+                      range={range}
+                      decode={decodeByDeployment}
+                      input={inputByDeployment}
+                      rpm={rpmByDeployment}
+                      wallClock={wallClockByDeployment}
+                    />
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </section>
