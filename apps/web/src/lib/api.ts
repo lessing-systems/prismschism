@@ -104,6 +104,13 @@ export interface InflightModelGroup {
   distinct: number;
 }
 
+export interface InflightBackend {
+  backend: string;
+  running: number | null;
+  waiting: number | null;
+  max: number | null;
+}
+
 export interface InflightResponse {
   inflight: InflightGauge;
   sessions: {
@@ -111,6 +118,7 @@ export interface InflightResponse {
     distinctTotal: number;
     byModel: InflightModelGroup[];
   };
+  backends: InflightBackend[];
 }
 
 /**
