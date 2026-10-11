@@ -1763,13 +1763,25 @@ export function buildInflightSessionsTotalSql(): string {
   );
 }
 
-/** The same distinct-identity count grouped by model_id, top 8 by count
- *  descending — the per-model axis of the sessions card. */
+/** The same distinct-identity count grouped by model_group, top 8 by count
+ *  descending — the per-model axis of the sessions card. Ghost-filter safe:
+ *  the inner JOIN on deployment_inventory drops metric-only model_ids (no
+ *  inventory row), the api_base check mirrors the real_hw backend-identity
+ *  guard, and grouping by i.model_group surfaces the front-end group rather
+ *  than raw deployment names — never "None"/"Other" buckets. The window is
+ *  bound as `$1` in MINUTES; nothing is interpolated. */
 export function buildInflightSessionsByModelSql(): string {
   return (
-    `SELECT model_id, COUNT(DISTINCT ("user", api_key_alias, team)) AS distinct_count FROM requests ` +
-    `WHERE ts >= now() - ($1 * interval '1 minute') ` +
-    `GROUP BY model_id ORDER BY distinct_count DESC LIMIT 8`
+    `SELECT i.model_group AS model_id, ` +
+    `COUNT(DISTINCT (r."user", r.api_key_alias, r.team)) AS distinct_count ` +
+    `FROM requests r ` +
+    `JOIN deployment_inventory i ON i.model_id = r.model_id ` +
+    `WHERE r.ts >= now() - ($1 * interval '1 minute') ` +
+    `AND r.model_id IS NOT NULL AND r.model_id <> '' AND r.model_id <> 'None' ` +
+    `AND COALESCE(i.api_base, '') <> '' ` +
+    `GROUP BY i.model_group ` +
+    `ORDER BY distinct_count DESC, model_id ASC ` +
+    `LIMIT 8`
   );
 }
 
@@ -1901,8 +1913,9 @@ export function toInflightModelGroups(rows: readonly InflightSessionsRow[]): Inf
  *  (undefined_table — migration 009 not applied yet), the gauge degrades to
  *  `{ ts: null, value: null }` and the response is still 200; if the
  *  backend_lanes query fails with 42P01 (migration 010 not applied yet),
- *  `backends` degrades to `[]` the same way. The sessions queries never touch
- *  either table and must always work. Any OTHER query failure is a 500, as in
+ *  `backends` degrades to `[]` the same way, and if the byModel sessions
+ *  query fails with 42P01 (deployment_inventory not yet backfilled), `byModel`
+ *  degrades to `[]` too. Any OTHER query failure is a 500, as in
  *  every other handler here. */
 function handleInflight(query: QueryFn, params: URLSearchParams, res: ServerResponse): void {
   const raw = params.get("windowMinutes");
@@ -1937,10 +1950,22 @@ function handleInflight(query: QueryFn, params: URLSearchParams, res: ServerResp
     [windowMinutes]
   ).then((result) => result.rows[0] as InflightTotalRow | undefined);
 
+  // The byModel sessions query: 42P01 (deployment_inventory missing/not yet
+  // backfilled) degrades to an empty array, the same tolerance shape as the
+  // in_flight gauge and backend_lanes above.
   const byModelRows: Promise<InflightSessionsRow[]> = query(
     buildInflightSessionsByModelSql(),
     [windowMinutes]
-  ).then((result) => result.rows as InflightSessionsRow[]);
+  )
+    .then((result) => result.rows as InflightSessionsRow[])
+    .catch((err: unknown) => {
+      if (isPgUndefinedTable(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn("deployment_inventory missing (migration not applied); emitting empty byModel:", message);
+        return [];
+      }
+      throw err;
+    });
 
   // The backends-lane query: 42P01 (migration 010 not yet applied) degrades
   // to an empty array, the same tolerance shape as the in_flight gauge above.

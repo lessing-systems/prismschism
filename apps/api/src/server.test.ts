@@ -28,6 +28,7 @@ import {
   buildBridgeSql,
   buildDerivedSql,
   buildHealthSql,
+  buildInflightSessionsByModelSql,
   buildKpiTotalRawSql,
   buildKpiTotalSql,
   buildLabelToModelIds,
@@ -52,6 +53,7 @@ import {
   RANGE_SECONDS,
   TIER_MAP,
   toBreakdown,
+  toInflightModelGroups,
   toPoints,
   tierForRange,
   TTFT_CLASSIFIER_AXES,
@@ -2900,7 +2902,7 @@ describe('GET /api/inflight — integration', () => {
       const sqls = q.mock.calls.map((c) => String(c[0]));
       expect(sqls.filter((s) => s.includes('FROM in_flight'))).toHaveLength(1);
       expect(sqls.filter((s) => s.includes('FROM backend_lanes'))).toHaveLength(1);
-      expect(sqls.filter((s) => s.includes('COUNT(DISTINCT ("user", api_key_alias, team))'))).toHaveLength(2);
+      expect(sqls.filter((s) => s.includes('COUNT(DISTINCT ('))).toHaveLength(2);
       for (const call of q.mock.calls) {
         if (String(call[0]).includes('FROM in_flight') || String(call[0]).includes('FROM backend_lanes')) {
           expect(call[1]).toEqual([]);
@@ -3039,5 +3041,71 @@ describe('GET /api/inflight — integration', () => {
       warnSpy.mockRestore();
       await srv.close();
     }
+  });
+
+  it('tolerates a missing deployment_inventory in byModel (42P01): 200 with empty byModel and the rest intact', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeInflightQuery({
+      inflight: [{ ts: '2026-10-11T00:00:00.000Z', value: '4', unit: 'count' }],
+      total: [{ distinct_total: '2' }],
+      fail: 'byModel',
+      code: '42P01',
+      lanes: [
+        { backend: 'alpha', running_lane: '1', waiting_lane: null, max_lane: '2' },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, 'windowMinutes=45');
+      expect(status).toBe(200);
+      expect(body.sessions).toEqual({ windowMinutes: 45, distinctTotal: 2, byModel: [] });
+      expect(body.inflight).toEqual({ ts: '2026-10-11T00:00:00.000Z', value: 4, unit: 'count' });
+      expect(body.backends).toEqual([{ backend: 'alpha', running: 1, waiting: null, max: 2 }]);
+      expect(q).toHaveBeenCalledTimes(4);
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('deployment_inventory missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await srv.close();
+    }
+  });
+});
+
+describe('buildInflightSessionsByModelSql — ghost-filter safe SQL (deployment_inventory join)', () => {
+  it('joins deployment_inventory, groups by the front-end model_group, and binds the window in minutes', () => {
+    const sql = buildInflightSessionsByModelSql();
+    // Inner JOIN drops metric-only ghosts (no inventory row); model_group is
+    // the front-end group (007 migration), not the raw deployment name.
+    expect(sql).toContain('FROM requests r');
+    expect(sql).toContain('JOIN deployment_inventory i ON i.model_id = r.model_id');
+    expect(sql).toContain('GROUP BY i.model_group');
+    // api_base check mirrors the real_hw backend-identity guard.
+    expect(sql).toContain("COALESCE(i.api_base, '') <> ''");
+    // Explicit exclusions: never bucket NULL/''/'None' model_ids.
+    expect(sql).toContain('r.model_id IS NOT NULL');
+    expect(sql).toContain("r.model_id <> ''");
+    expect(sql).toContain("r.model_id <> 'None'");
+    // The window is parameterized in MINUTES; the alias keeps the row contract.
+    expect(sql).toContain("now() - ($1 * interval '1 minute')");
+    expect(sql).toContain('AS model_id');
+    expect(sql).toContain('AS distinct_count');
+  });
+});
+
+describe('toInflightModelGroups — byModel rows → contract items', () => {
+  it('maps inventory-group rows to { modelId, distinct } with numeric coercion and deterministic ordering', () => {
+    expect(
+      toInflightModelGroups([
+        { model_id: 'group-b', distinct_count: '3' },
+        { model_id: 'group-a', distinct_count: '2' },
+        { model_id: 'group-a', distinct_count: '9' },
+        { model_id: 'group-c', distinct_count: 'not-a-number' },
+      ])
+    ).toEqual([
+      { modelId: 'group-a', distinct: 9 },
+      { modelId: 'group-b', distinct: 3 },
+      { modelId: 'group-a', distinct: 2 },
+      { modelId: 'group-c', distinct: 0 },
+    ]);
   });
 });
