@@ -228,6 +228,17 @@ func scrapeTarget(ctx context.Context, t targets.Target, w store.Writer, fetch *
 		log.Printf("target %s: cardinality tripwire tripped at %d series — excess dropped, allowed rows written", t.Name, result.SeriesCount)
 	}
 
+	// Backend_lanes rows carry the target's name as their backend identity —
+	// the SAME identity WriteHealth records for this target — so the stored
+	// tensorfold lane gauges are attributable to the scraped endpoint. The
+	// source gauges are unlabeled, so the parser leaves Row.Backend empty for
+	// this family; every other family's Backend stays "" (untouched).
+	for i := range result.Rows {
+		if result.Rows[i].Family == parser.FamilyBackendLanes {
+			result.Rows[i].Backend = t.Name
+		}
+	}
+
 	// Apply per-series delta policy before writing:
 	// counter series are stored as per-interval deltas (first sample skipped,
 	// resets handled by the tracker) and gauge series are stored raw. Rows the
