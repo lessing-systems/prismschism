@@ -56,6 +56,13 @@ func TestLatencyColumnsCarryMetric(t *testing.T) {
 			}
 		})
 	}
+	t.Run("in_flight columns are exactly ts, model_id, value, unit", func(t *testing.T) {
+		want := []string{"ts", "model_id", "value", "unit"}
+		got := familyColumns["in_flight"].columns
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("in_flight columns = %v, want %v", got, want)
+		}
+	})
 }
 
 // TestLatencyMetricIndexMatchesTokenColumns asserts position parity: the metric
