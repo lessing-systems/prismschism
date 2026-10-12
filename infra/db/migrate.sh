@@ -130,7 +130,7 @@ fi
 
 applied=0
 skipped=0
-pending=0
+failed=0
 
 for file in "$MIGRATIONS_DIR"/*.sql; do
     [ -f "$file" ] || continue
@@ -148,12 +148,12 @@ for file in "$MIGRATIONS_DIR"/*.sql; do
         applied=$((applied + 1))
         log "Applied $base (committed, recorded in ledger)."
     else
-        pending=$((pending + 1))
+        failed=$((failed + 1))
         log ""
         log "MIGRATION FAILED: $base — database unchanged (transaction rolled back)."
         log "MIGRATION FAILED: Fix and re-run 'docker compose up db-migrate'."
         log ""
-        log "Applied this run: $applied, skipped (already in ledger): $skipped, pending: $pending."
+        log "Applied this run: $applied, skipped (already in ledger): $skipped, failed: $failed."
         exit 1
     fi
 done

@@ -62,7 +62,7 @@ Open <http://localhost:5173>.
 
 Schema changes ship as SQL files in `infra/db/migrations/` and are applied by a one-shot `db-migrate` service that runs automatically on every `docker compose up` (the scraper waits for it). Migrations are tracked in a `prismschism_migrations` ledger table and are atomic per file: a failing migration rolls back completely, never leaves the database half-applied, and is retried on the next `up` once fixed.
 
-- **Existing installs** (created before migrations existed) are auto-baselined: if your database already has the pre-migrator schema, migrations `001`–`008` are recorded as applied and only `009`+ actually run.
+- **Existing installs** (created before migrations existed) are auto-baselined: if your database already has the pre-migrator schema, migrations `001`–`008` are recorded as applied and only `009`+ actually run. Note: the baseline heuristic is coarse — a database with only PART of 001-008 applied is treated as fully baseline; if your schema is in that rare state, reconcile it manually first (the migrator fails loudly rather than guessing).
 - **To run migrations on demand** (e.g. with a custom compose file, or against a remote database), invoke the script manually:
 
   ```bash

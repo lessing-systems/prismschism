@@ -32,9 +32,11 @@
 --   - add_compression_policy / add_retention_policy: if_not_exists => TRUE
 --   The entire script is safe to re-run with zero errors.
 --
--- NOTE: No explicit BEGIN/COMMIT — each statement auto-commits.
---   This is required because add_compression_policy cannot see uncommitted
---   catalog changes from ALTER TABLE SET within the same transaction.
+-- Transaction contract: the db-migrate runner wraps this file in a single
+--   transaction (psql -1); verified on timescaledb 2.30.1 / pg16 — including
+--   add_compression_policy visibility of same-transaction catalog changes.
+--   If applying manually WITHOUT a transaction wrapper, note that policy
+--   functions may need the statements split.
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
