@@ -3505,9 +3505,47 @@ describe('buildError*Sql — parameterized windows, ghost-filter, redaction-by-c
     expect(sql).toContain('FROM instance_health');
     expect(sql).toContain("now() - ($1 * interval '1 second')");
     expect(sql).toContain('up IS FALSE');
+    // The scraper's liveness heartbeat (apps/scraper/main.go runCycle writes
+    // one backend='scraper-tick' up=false row per cycle) must be excluded.
+    expect(sql).toContain("backend <> 'scraper-tick'");
     expect(sql.toLowerCase()).not.toContain('status');
     expect(sql.toLowerCase()).not.toContain('select *');
     expect(sql).not.toMatch(/,\s*\*/);
+  });
+
+  it('excludes the scraper tick heartbeat from scrape-fail events; a genuine up=false row still surfaces', async () => {
+    // The exact heartbeat row apps/scraper/main.go runCycle writes every
+    // cycle: backend 'scraper-tick', up=false, status 'tick'. A liveness
+    // marker, NOT a failure — it must never reach /api/errors.
+    const scrapeRows = [
+      { ts: '2026-10-12T10:10:00.000Z', backend: 'scraper-tick', up: false, status: 'tick' },
+      // A genuine scrape failure on a real target: still an event.
+      { ts: '2026-10-12T10:11:00.000Z', backend: 'beta', up: false },
+    ];
+    // A fake that emulates the DB: it applies the exclusion in the scrape-fail
+    // SQL's WHERE clause, so the test pins that the SQL (not the mapper) is
+    // what keeps the heartbeat out — drop the filter from the SQL and the
+    // fake hands back both rows, failing the length assertion below.
+    const q = vi.fn(async (sql: string) => {
+      if (sql.includes('FROM instance_health')) {
+        expect(sql).toContain("up IS FALSE AND backend <> 'scraper-tick'");
+        return {
+          rows: scrapeRows.filter((r) => r.backend !== 'scraper-tick' || !sql.includes("backend <> 'scraper-tick'")),
+        };
+      }
+      return { rows: [] };
+    }) as unknown as FakeQuery;
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getErrors(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.errors).toHaveLength(1);
+      expect(body.errors[0].kind).toBe('scrape-fail');
+      expect(body.errors[0].subject).toBe('beta');
+      expect(body.errors[0].ts).toBe('2026-10-12T10:11:00.000Z');
+    } finally {
+      await srv.close();
+    }
   });
 });
 

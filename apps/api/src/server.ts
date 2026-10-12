@@ -2271,13 +2271,16 @@ export function buildErrorLaneWaitsSql(): string {
  *  `up` filter: the only captured fragment is the second one, and it carries
  *  neither `up` nor a select list. The select list is ts and backend ONLY —
  *  the raw status text is an identity vector (scraper fetch-error strings
- *  embed the target URL) and must never leave the DB. Window bound as `$1` in
- *  SECONDS; nothing is interpolated. */
+ *  embed the target URL) and must never leave the DB. The scraper's own
+ *  liveness heartbeat (apps/scraper/main.go runCycle: one row per cycle with
+ *  backend 'scraper-tick', up=false, status 'tick' — a liveness marker, not a
+ *  failure) is excluded here so it cannot flood /api/errors. Window bound as
+ *  `$1` in SECONDS; nothing is interpolated. */
 export function buildErrorScrapeFailsSql(): string {
   return (
     `SELECT ts, backend ` +
     `FROM instance_health WHERE ts >= now() - ($1 * interval '1 second') AND ` +
-    `up IS FALSE ORDER BY ts DESC`
+    `up IS FALSE AND backend <> 'scraper-tick' ORDER BY ts DESC`
   );
 }
 
