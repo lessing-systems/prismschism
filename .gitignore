@@ -4,6 +4,8 @@ node_modules/
 .npm/
 # Go build cache (repo-root GOCACHE artifacts)
 .cache/
+# pip --user installs run with HOME at the repo root (machine-local)
+.local/
 # Docker CLI local state: buildx cache + desktop context config (machine-local, not project)
 .docker/
 # Go caches and build artifacts
