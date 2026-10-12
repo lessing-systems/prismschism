@@ -1,6 +1,7 @@
 -- ============================================================================
 -- 010_backend_lanes.sql
 -- Date: 2026-10-11
+-- Idempotent: safe to re-apply on databases where it was applied manually.
 --
 -- Purpose:
 --   Create backend_lanes: per-backend tensorfold lane gauges. Four source

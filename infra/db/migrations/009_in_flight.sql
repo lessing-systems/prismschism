@@ -1,6 +1,7 @@
 -- ============================================================================
 -- 009_in_flight.sql
 -- Date: 2026-10-11
+-- Idempotent: safe to re-apply on databases where it was applied manually.
 --
 -- Purpose:
 --   Create in_flight: the litellm_in_flight_requests GAUGE — the number of
