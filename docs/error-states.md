@@ -23,6 +23,10 @@ a log; query the DB (table names below) for anything older than 24h.
 ### Upstream 500 — `cooldown`
 **What happened:** while LiteLLM was routing a request, the upstream returned an HTTP
 5xx; LiteLLM put that deployment on cooldown and stopped sending traffic for a while.
+Each row names the affected deployment and the backend it points at — `Affected
+deployment: <model_id> → <api_base> (model file: <raw_model>)` — so you can go straight
+to that upstream's log. Ghost series with no inventory row get the generic sentence and
+no identifiers (we never print a host we cannot resolve).
 **Why decode drops to 0 during it:** cooled deployments receive no traffic, so nothing
 generates. That is a symptom of the cooldown, not a separate fault.
 **What to do:** one-off → ignore. Recurring under load → the upstream's capacity is too
@@ -32,7 +36,11 @@ own log at the timestamps for the actual error body (our metrics only carry stat
 
 ### Deployment unhealthy — `state-error`
 **What happened:** LiteLLM reported the deployment's state as non-healthy for a run of
-scrape ticks. **Stored in:** `deployment_health`.
+scrape ticks. Resolved rows name the deployment and its backend — `LiteLLM reported
+deployment <model_id> unhealthy for N consecutive scrape ticks. It points at <api_base>
+(model file: <raw_model>)` — so you know which upstream to open. Unresolved (ghost)
+series keep the generic sentence with no identifiers.
+**Stored in:** `deployment_health`.
 **What to do:** check the upstream process and its logs in the episode window. If the
 badge is red while the Errors tab shows nothing new, trust the Errors tab.
 
@@ -43,9 +51,11 @@ small for the traffic — raise it (if memory allows) or add a second replica. A
 spike during a burst is normal. **Stored in:** `backend_lanes` (metric `waiting`).
 
 ### Metrics scrape failed — `scrape-fail`
-**What happened:** our scraper could not fetch a target's metrics endpoint.
-**Important:** this is a monitoring gap, not proof that the service is down — the
-service may have been perfectly fine while our view was dark. **What to do:** check
+**What happened:** our scraper could not fetch a target's metrics endpoint for that
+scrape tick. While the target was unreachable, **no metrics were collected for the
+deployments it serves — the dashboard was blind** for that window; that is not proof the
+deployments were down. (The data model records no target→deployment-group mapping today,
+so the row cannot name which groups went dark.) **What to do:** check
 connectivity to the target; after any restart of the metrics source, expect a short
 gap while counters re-baseline (the first tick after a restart is discarded by design).
 **Stored in:** `instance_health` (`up = false`). The raw error text is deliberately
@@ -73,7 +83,10 @@ Two deliberate rules live behind this table:
 
 Series with no row in `deployment_inventory` ("metric-only" ghosts) and inventory rows
 without an endpoint are excluded from groupings, sums, and cards — including literal
-`None`/empty model ids. Deployments removed from LiteLLM are pruned from the roster on
+`None`/empty model ids. In the **Errors tab** a ghost can still surface as a row, but it
+carries only the generic explanation — never a deployment name, backend URL, or model
+file, since we never print identifiers we cannot resolve from the inventory.
+Deployments removed from LiteLLM are pruned from the roster on
 the next successful inventory sync after a 24h grace. If a card shows a flat zero
 forever, that is a rostered-but-dead deployment; it disappears within ~24h of the sync
 seeing it gone.

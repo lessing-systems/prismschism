@@ -2212,8 +2212,10 @@ const ERRORS_LIMIT_MAX = 1000;
  *  first tick of each partition has no predecessor inside the window, so its
  *  delta is NULL and `delta > 0` drops it — an undercount of exactly one
  *  tick's increment per series, accepted to keep the query single-pass. The
- *  ghost-filter join mirrors buildInflightSessionsByModelSql. Window bound as
- *  `$1` in SECONDS; nothing is interpolated. */
+ *  inventory join is a ghost-safe LEFT JOIN: a metric-only ghost row survives
+ *  with NULL inventory columns, and the mapper falls back to the generic
+ *  sentence — no host is ever invented (AGENTS.md ghost-filter). Window bound
+ *  as `$1` in SECONDS; nothing is interpolated. */
 export function buildErrorCooldownSql(): string {
   return (
     `WITH deltas AS (` +
@@ -2224,13 +2226,13 @@ export function buildErrorCooldownSql(): string {
     `AND model_id IS NOT NULL AND model_id <> '' AND model_id <> 'None' ` +
     `AND exception_status IS NOT NULL AND exception_status <> '' ` +
     `) ` +
-    `SELECT i.model_group, d.exception_status, d.bucket, d.max_delta FROM (` +
+    `SELECT i.model_id AS inv_model_id, i.api_base, COALESCE(i.raw_model, '') AS raw_model, ` +
+    `i.model_group, d.exception_status, d.bucket, d.max_delta FROM (` +
     `SELECT model_id, exception_status, date_trunc('minute', ts) AS bucket, ` +
     `max(delta) AS max_delta FROM deltas WHERE delta > 0 ` +
     `GROUP BY model_id, exception_status, date_trunc('minute', ts)` +
     `) d ` +
-    `JOIN deployment_inventory i ON i.model_id = d.model_id ` +
-    `WHERE COALESCE(i.api_base, '') <> '' ` +
+    `LEFT JOIN deployment_inventory i ON i.model_id = d.model_id ` +
     `ORDER BY d.bucket DESC`
   );
 }
@@ -2240,15 +2242,17 @@ export function buildErrorCooldownSql(): string {
  *  join mirrors buildInflightSessionsByModelSql. Window bound as `$1` in
  *  SECONDS; nothing is interpolated. (This literal deliberately contains the
  *  word `status` — it reads deployment_health, not instance_health, so the
- *  instance_health source guard does not apply.) */
+ *  instance_health source guard does not apply.) The inventory join is a
+ *  ghost-safe LEFT JOIN: a ghost model_id survives with NULL inventory
+ *  columns, and the mapper falls back to the generic sentence — no host is
+ *  ever invented (AGENTS.md ghost-filter). */
 export function buildErrorStateHealthSql(): string {
   return (
-    `SELECT h.ts, h.model_id, h.status, i.model_group ` +
+    `SELECT h.ts, h.model_id, h.status, i.model_group, i.api_base, COALESCE(i.raw_model, '') AS raw_model ` +
     `FROM deployment_health h ` +
-    `JOIN deployment_inventory i ON i.model_id = h.model_id ` +
+    `LEFT JOIN deployment_inventory i ON i.model_id = h.model_id ` +
     `WHERE h.ts >= now() - ($1 * interval '1 second') ` +
     `AND h.model_id IS NOT NULL AND h.model_id <> '' AND h.model_id <> 'None' ` +
-    `AND COALESCE(i.api_base, '') <> '' ` +
     `ORDER BY h.model_id, h.ts ASC`
   );
 }
@@ -2301,16 +2305,30 @@ function errorCount(n: unknown): number {
  *  (model_id, exception_status, minute) bucket from SQL; `count` is the max
  *  delta in the bucket. Severity "error": the upstream refused real traffic. */
 export function toCooldownEvents(rows: readonly any[]): ErrorEvent[] {
-  return rows.map((row) => ({
-    ts: errorTsIso(row.bucket) ?? "",
-    kind: "cooldown",
-    subject: String(row.model_group ?? ""),
-    severity: "error",
-    count: errorCount(row.max_delta),
-    detail:
-      `HTTP ${String(row.exception_status ?? "unknown")} from the upstream while LiteLLM was routing a request — ` +
-      `the deployment was put on cooldown. Recurring under load means upstream capacity (lanes/KV cache) is too small.`,
-  }));
+  return rows.map((row) => {
+    // Ghost-safe enrichment: identifiers only when the inventory row resolved
+    // (non-empty model_id AND api_base); otherwise the generic sentence with
+    // no deployment/backends clause — a missing row must never invent a host.
+    const invModelId = String(row.inv_model_id ?? "");
+    const apiBase = String(row.api_base ?? "");
+    const rawModel = String(row.raw_model ?? "");
+    const resolved = invModelId !== "" && apiBase !== "";
+    return {
+      ts: errorTsIso(row.bucket) ?? "",
+      kind: "cooldown",
+      subject: String(row.model_group ?? ""),
+      severity: "error",
+      count: errorCount(row.max_delta),
+      detail: resolved
+        ? `HTTP ${String(row.exception_status ?? "unknown")} from the upstream while LiteLLM was routing a request — ` +
+          `the deployment was put on cooldown. ` +
+          `Affected deployment: ${invModelId} → ${apiBase} (model file: ${rawModel}). ` +
+          `Recurring under load means upstream capacity (lanes/KV cache) is too small.`
+        : `HTTP ${String(row.exception_status ?? "unknown")} from the upstream while LiteLLM was routing a request — ` +
+          `the deployment was put on cooldown. ` +
+          `Recurring under load means upstream capacity (lanes/KV cache) is too small.`,
+    };
+  });
 }
 
 /** deployment_health ticks (ordered per model_id by ts) -> "state-error"
@@ -2330,23 +2348,41 @@ export function toStateErrorEpisodes(rows: readonly any[]): ErrorEvent[] {
   const events: ErrorEvent[] = [];
   let runKey: string | null = null;
   let runSubject = "";
+  let runInvModelId: unknown = null;
+  let runApiBase: unknown = null;
+  let runRawModel: unknown = null;
   let startTs: string | null = null;
   let ticks = 0;
   const flush = () => {
     if (runKey !== null && startTs !== null && ticks > 0) {
+      // Ghost-safe enrichment: identifiers only when the inventory row
+      // resolved; a ghost run keeps the generic sentence with no invented
+      // deployment/backends clause (AGENTS.md ghost-filter).
+      const invModelId = String(runInvModelId ?? "");
+      const apiBase = String(runApiBase ?? "");
+      const rawModel = String(runRawModel ?? "");
+      const resolved = invModelId !== "" && apiBase !== "";
       events.push({
         ts: startTs,
         kind: "state-error",
         // The front-end group, never the raw deployment name (AGENTS.md
-        // ghost-filter: rows are already inventory-resolved by the query).
+        // ghost-filter: the subject stays the group even for ghost runs).
         subject: runSubject,
         severity: "error",
         count: ticks,
-        detail: `LiteLLM reported this deployment unhealthy for ${ticks} consecutive scrape ticks. Check the upstream process and its logs around this time.`,
+        detail: resolved
+          ? `LiteLLM reported deployment ${invModelId} unhealthy for ${ticks} consecutive scrape ticks. ` +
+            `It points at ${apiBase} (model file: ${rawModel}). ` +
+            `Check that upstream process and its logs around this time.`
+          : `LiteLLM reported this deployment unhealthy for ${ticks} consecutive scrape ticks. ` +
+            `Check the upstream process and its logs around this time.`,
       });
     }
     runKey = null;
     runSubject = "";
+    runInvModelId = null;
+    runApiBase = null;
+    runRawModel = null;
     startTs = null;
     ticks = 0;
   };
@@ -2361,6 +2397,9 @@ export function toStateErrorEpisodes(rows: readonly any[]): ErrorEvent[] {
       flush();
       runKey = key;
       runSubject = String(row.model_group ?? "");
+      runInvModelId = row.inv_model_id;
+      runApiBase = row.api_base;
+      runRawModel = row.raw_model;
       startTs = ts;
       ticks = 1;
     } else {
@@ -2427,7 +2466,10 @@ export function toLaneWaitEpisodes(rows: readonly any[]): ErrorEvent[] {
 /** instance_health up=false rows -> "scrape-fail" items, one per row. The
  *  mapper reads ONLY ts and backend — the row's raw status text (if a mock or
  *  future query ever carries it) can never reach the payload. Severity
- *  "warning": a monitoring gap, not proof of an outage. */
+ *  "warning": a monitoring gap, not proof of an outage. Each row is exactly
+ *  one scrape cycle, so the blind window is one tick per event — the data
+ *  model records no target→deployment mapping, so the detail cannot name the
+ *  deployments that went dark and says so honestly instead. */
 export function toScrapeFailEvents(rows: readonly any[]): ErrorEvent[] {
   return rows.map((row) => ({
     ts: errorTsIso(row.ts) ?? "",
@@ -2436,8 +2478,9 @@ export function toScrapeFailEvents(rows: readonly any[]): ErrorEvent[] {
     severity: "warning",
     count: 1,
     detail:
-      `Our scraper could not fetch this target's metrics endpoint. ` +
-      `The service itself may be fine — this is a monitoring gap, not proof of an outage.`,
+      `Our scraper could not fetch this target's metrics endpoint for 1 tick. ` +
+      `While it was unreachable, no metrics were collected for the deployments it serves — ` +
+      `the dashboard was blind, which is not proof the deployments were down.`,
   }));
 }
 

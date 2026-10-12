@@ -3227,8 +3227,9 @@ describe('GET /api/errors — integration', () => {
             severity: 'warning',
             count: 1,
             detail:
-              "Our scraper could not fetch this target's metrics endpoint. " +
-              'The service itself may be fine — this is a monitoring gap, not proof of an outage.',
+              "Our scraper could not fetch this target's metrics endpoint for 1 tick. " +
+              'While it was unreachable, no metrics were collected for the deployments it serves — ' +
+              'the dashboard was blind, which is not proof the deployments were down.',
           },
           {
             ts: '2026-10-12T10:07:00.000Z',
@@ -3468,26 +3469,30 @@ describe('GET /api/errors — integration', () => {
 });
 
 describe('buildError*Sql — parameterized windows, ghost-filter, redaction-by-construction', () => {
-  it('cooldown SQL computes lag deltas, coalesces to 1-minute max buckets, ghost-filters via deployment_inventory', () => {
+  it('cooldown SQL computes lag deltas, coalesces to 1-minute max buckets, ghost-safe LEFT JOINs deployment_inventory', () => {
     const sql = buildErrorCooldownSql();
     expect(sql).toContain("now() - ($1 * interval '1 second')");
     expect(sql).toContain('lag(value) OVER (PARTITION BY model_id, exception_status ORDER BY ts)');
     expect(sql).toContain("date_trunc('minute', ts)");
     expect(sql).toContain('max(delta) AS max_delta');
-    // Ghost-filter: inner inventory join, api_base identity check, no raw
-    // None/'' model_ids — the buildInflightSessionsByModelSql discipline.
-    expect(sql).toContain('JOIN deployment_inventory i ON i.model_id = d.model_id');
-    expect(sql).toContain("COALESCE(i.api_base, '') <> ''");
+    // Ghost-safe LEFT JOIN: ghosts keep NULL inventory columns (the mapper
+    // falls back to the generic sentence) and the deployment identity
+    // (model_id, api_base, raw_model) reaches the mapper for enrichment.
+    expect(sql).toContain('LEFT JOIN deployment_inventory i ON i.model_id = d.model_id');
+    expect(sql).toContain('i.model_id AS inv_model_id');
+    expect(sql).toContain('i.api_base');
+    expect(sql).toContain("COALESCE(i.raw_model, '') AS raw_model");
     expect(sql).toContain("model_id <> 'None'");
   });
 
-  it('state SQL selects every tick (not DISTINCT ON) ordered for island collapsing, ghost-filtered the same way', () => {
+  it('state SQL selects every tick (not DISTINCT ON) ordered for island collapsing, ghost-safe LEFT JOIN for enrichment', () => {
     const sql = buildErrorStateHealthSql();
     expect(sql).toContain("now() - ($1 * interval '1 second')");
     expect(sql).toContain('ORDER BY h.model_id, h.ts ASC');
     expect(sql).not.toContain('DISTINCT ON');
-    expect(sql).toContain('JOIN deployment_inventory i ON i.model_id = h.model_id');
-    expect(sql).toContain("COALESCE(i.api_base, '') <> ''");
+    expect(sql).toContain('LEFT JOIN deployment_inventory i ON i.model_id = h.model_id');
+    expect(sql).toContain('i.api_base');
+    expect(sql).toContain("COALESCE(i.raw_model, '') AS raw_model");
     expect(sql).toContain("model_id <> 'None'");
   });
 
@@ -3589,5 +3594,62 @@ describe('toStateErrorEpisodes / toLaneWaitEpisodes — island collapsing units'
     expect(events[0].detail).toContain('HTTP 429 from the upstream');
     expect(events[1].count).toBe(0);
     expect(events[1].detail).toContain('HTTP unknown from the upstream');
+  });
+
+  it('cooldown: an inventory-resolved row names deployment + backend; a ghost row falls back with NO host string', () => {
+    const events = toCooldownEvents([
+      // Enriched: deployment_inventory row resolved (TEST-NET-1 placeholder).
+      {
+        model_group: 'grp-a', exception_status: '500', bucket: '2026-10-12T10:07:00.000Z', max_delta: '2',
+        inv_model_id: 'dep-alpha', api_base: 'http://192.0.2.10:8000/v1', raw_model: 'model-a.yaml',
+      },
+      // Fallback: LEFT JOIN found no inventory row -> NULLs; no host invented.
+      {
+        model_group: '', exception_status: '429', bucket: '2026-10-12T10:08:00.000Z', max_delta: '1',
+        inv_model_id: null, api_base: null, raw_model: '',
+      },
+    ]);
+    expect(events[0].detail).toBe(
+      'HTTP 500 from the upstream while LiteLLM was routing a request — the deployment was put on cooldown. ' +
+        'Affected deployment: dep-alpha → http://192.0.2.10:8000/v1 (model file: model-a.yaml). ' +
+        'Recurring under load means upstream capacity (lanes/KV cache) is too small.'
+    );
+    expect(events[1].detail).toBe(
+      'HTTP 429 from the upstream while LiteLLM was routing a request — the deployment was put on cooldown. ' +
+        'Recurring under load means upstream capacity (lanes/KV cache) is too small.'
+    );
+    expect(events[1].detail).not.toContain('http://');
+    expect(events[1].detail).not.toContain('Affected deployment');
+  });
+
+  it('state: an inventory-resolved run names deployment + backend; a ghost run falls back with NO host string', () => {
+    const events = toStateErrorEpisodes([
+      { ts: '2026-10-12T10:00:00.000Z', model_id: 'dep-alpha', status: 'error', model_group: 'grp-a', inv_model_id: 'dep-alpha', api_base: 'http://192.0.2.10:8000/v1', raw_model: 'model-a.yaml' },
+      { ts: '2026-10-12T10:01:00.000Z', model_id: 'dep-alpha', status: 'error', model_group: 'grp-a', inv_model_id: 'dep-alpha', api_base: 'http://192.0.2.10:8000/v1', raw_model: 'model-a.yaml' },
+      // Ghost model_id: LEFT JOIN left the inventory columns NULL.
+      { ts: '2026-10-12T10:02:00.000Z', model_id: 'ghost-dep', status: 'error', model_group: '', inv_model_id: null, api_base: null, raw_model: null },
+    ]);
+    expect(events).toHaveLength(2);
+    expect(events[0].detail).toBe(
+      'LiteLLM reported deployment dep-alpha unhealthy for 2 consecutive scrape ticks. ' +
+        'It points at http://192.0.2.10:8000/v1 (model file: model-a.yaml). ' +
+        'Check that upstream process and its logs around this time.'
+    );
+    expect(events[1]).toMatchObject({ subject: '', count: 1 });
+    expect(events[1].detail).toBe(
+      'LiteLLM reported this deployment unhealthy for 1 consecutive scrape ticks. ' +
+        'Check the upstream process and its logs around this time.'
+    );
+    expect(events[1].detail).not.toContain('http://');
+    expect(events[1].detail).not.toContain('ghost-dep');
+  });
+
+  it('scrape-fail: the detail states the blind window honestly (no target→deployment mapping exists)', () => {
+    const events = toScrapeFailEvents([{ ts: '2026-10-12T10:10:00.000Z', backend: 'beta' }]);
+    expect(events[0].detail).toBe(
+      "Our scraper could not fetch this target's metrics endpoint for 1 tick. " +
+        'While it was unreachable, no metrics were collected for the deployments it serves — ' +
+        'the dashboard was blind, which is not proof the deployments were down.'
+    );
   });
 });
