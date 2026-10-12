@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"prismschism/scraper/internal/inventory"
 )
@@ -30,6 +32,42 @@ func nilIfEmpty(s string) *string {
 	return &s
 }
 
+// The Syncer (internal/inventory) returns only the deployment count from a
+// sync, so the model_id set of each SUCCESSFUL upsert is captured here as a
+// side channel: main reads it back with LastSyncedModelIDs after a fully
+// successful sync and passes it to PruneDeployments. This threads the sync set
+// to the prune call site without widening the Syncer's signature. Guarded by a
+// mutex because UpsertDeployments is part of the Upserter interface and could
+// in principle be called from more than one goroutine.
+var (
+	syncedIDsMu sync.Mutex
+	syncedIDs   []string
+)
+
+// recordSyncedModelIDs stores the model_id list of a completed upsert. Called
+// only on success paths — a failed exec leaves the previous value, which is
+// unreachable for pruning because the caller prunes only after a fully
+// successful sync (whose own upsert has then recorded its set).
+func recordSyncedModelIDs(deps []inventory.Deployment) {
+	ids := make([]string, len(deps))
+	for i, d := range deps {
+		ids[i] = d.ModelID
+	}
+	syncedIDsMu.Lock()
+	syncedIDs = ids
+	syncedIDsMu.Unlock()
+}
+
+// LastSyncedModelIDs returns the model_id list persisted by the most recent
+// successful UpsertDeployments call (nil when that upsert carried no
+// deployments — an empty catalog is a successful sync whose keep set is
+// empty).
+func LastSyncedModelIDs() []string {
+	syncedIDsMu.Lock()
+	defer syncedIDsMu.Unlock()
+	return syncedIDs
+}
+
 // UpsertDeployments persists a parsed deployment catalog as ONE multi-row
 // upsert keyed on model_id. This is an upsert only — it never deletes and never
 // nulls last_alive. An api_base or raw_model that LiteLLM omitted arrives as an
@@ -39,6 +77,10 @@ func nilIfEmpty(s string) *string {
 // is executed).
 func (p *PG) UpsertDeployments(ctx context.Context, deps []inventory.Deployment) error {
 	if len(deps) == 0 {
+		// An empty catalog is still a SUCCESSFUL sync: record the (empty)
+		// keep set so a subsequent prune does not consult a stale list and
+		// accidentally shield rows that have vanished from the roster.
+		recordSyncedModelIDs(deps)
 		return nil
 	}
 
@@ -80,5 +122,42 @@ func (p *PG) UpsertDeployments(ctx context.Context, deps []inventory.Deployment)
 	if _, err := p.db.ExecContext(ctx, query, args...); err != nil {
 		return fmt.Errorf("upsert deployments: %w", err)
 	}
+	// Only a successful exec updates the recorded sync set (see
+	// recordSyncedModelIDs).
+	recordSyncedModelIDs(deps)
 	return nil
+}
+
+// pruneInventorySQL deletes roster rows that are absent from the successful
+// sync's keep set AND whose last_alive is older than the grace period. $1 is a
+// text[] of model_ids, $2 the grace in seconds via make_interval — no values
+// are ever interpolated into the statement text.
+const pruneInventorySQL = `DELETE FROM deployment_inventory
+WHERE model_id <> ALL($1::text[])
+  AND last_alive < now() - make_interval(secs => $2::int)`
+
+// PruneDeployments removes deployments that vanished from LiteLLM's roster:
+// it deletes only rows absent from keep — the model_id set of a SUCCESSFUL
+// inventory sync — AND quiet past the grace (olderThan). Live deployments
+// refresh last_alive on every upsert (see UpsertDeployments), so the grace
+// only bites long-dead rows; a row still present in a live catalog is
+// protected both by its own sync's keep set and by its freshly refreshed
+// last_alive. A failed sync never reaches this method (the caller prunes only
+// on success), so the last-known-good guarantee of failed /model/info polls
+// is preserved. keep may be nil or empty, which is a valid keep set (an
+// empty catalog) — ALL() over an empty array is vacuously true, so every
+// quiet row is then prunable. Returns the number of rows deleted.
+func (p *PG) PruneDeployments(ctx context.Context, keep []string, olderThan time.Duration) (int64, error) {
+	if keep == nil {
+		keep = []string{}
+	}
+	res, err := p.db.ExecContext(ctx, pruneInventorySQL, keep, int(olderThan.Seconds()))
+	if err != nil {
+		return 0, fmt.Errorf("prune deployment_inventory: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("prune deployment_inventory: rows affected: %w", err)
+	}
+	return n, nil
 }
