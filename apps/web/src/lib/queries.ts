@@ -4,6 +4,7 @@ import { useSyncExternalStore } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   fetchBreakdown,
+  fetchErrors,
   fetchInflight,
   fetchKpis,
   fetchSeries,
@@ -14,6 +15,8 @@ import {
 import type { Metric, Range } from "./types";
 
 const REFETCH_INTERVAL = 15000;
+// Errors tab is a history view: 30s is enough.
+const ERRORS_REFETCH_INTERVAL = 30000;
 
 export function useKpis(range: Range) {
   return useQuery({
@@ -44,6 +47,14 @@ export function useInflight(windowMinutes?: number) {
     queryKey: ["inflight", windowMinutes],
     queryFn: () => fetchInflight(windowMinutes),
     refetchInterval: REFETCH_INTERVAL,
+  });
+}
+
+export function useErrors(windowHours?: number, limit?: number) {
+  return useQuery({
+    queryKey: ["errors", windowHours, limit],
+    queryFn: () => fetchErrors(windowHours, limit),
+    refetchInterval: ERRORS_REFETCH_INTERVAL,
   });
 }
 

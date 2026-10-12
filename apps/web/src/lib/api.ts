@@ -131,3 +131,30 @@ export function fetchInflight(windowMinutes?: number): Promise<InflightResponse>
     windowMinutes: windowMinutes === undefined ? undefined : String(windowMinutes),
   });
 }
+
+export type ErrorKind = "cooldown" | "state-error" | "lane-wait" | "scrape-fail";
+
+export interface ErrorEvent {
+  ts: string;
+  kind: ErrorKind;
+  subject: string;
+  severity: "error" | "warning";
+  count: number;
+  detail: string;
+}
+
+export interface ErrorsResponse {
+  errors: ErrorEvent[];
+}
+
+/**
+ * Recent error events (server default window/limit when omitted), sorted ts
+ * DESC by the API. 400 on non-numeric params; per-source missing tables are
+ * tolerated server-side (empty contributions).
+ */
+export function fetchErrors(windowHours?: number, limit?: number): Promise<ErrorsResponse> {
+  return getJson<ErrorsResponse>("/errors", {
+    windowHours: windowHours === undefined ? undefined : String(windowHours),
+    limit: limit === undefined ? undefined : String(limit),
+  });
+}
