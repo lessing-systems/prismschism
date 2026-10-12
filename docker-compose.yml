@@ -56,7 +56,6 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-litellm_dev_password}
     volumes:
       - db_data:/var/lib/postgresql/data
-      - ./infra/db/migrations:/docker-entrypoint-initdb.d:ro
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
@@ -64,6 +63,23 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+  db-migrate:
+    image: timescale/timescaledb:2.30.1-pg16
+    container_name: prismschism-db-migrate
+    environment:
+      - POSTGRES_DB=litellm
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-litellm_dev_password}
+      - DB_HOST=db
+      - MIGRATIONS_DIR=/migrations
+    volumes:
+      - ./infra/db/migrations:/migrations:ro
+      - ./infra/db/migrate.sh:/migrate.sh:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["sh", "/migrate.sh"]
+    restart: "no"
   scraper:
     build:
       context: ./apps/scraper
@@ -77,6 +93,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
     volumes:
       - ./config:/config:ro
     restart: unless-stopped

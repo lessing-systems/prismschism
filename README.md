@@ -58,6 +58,30 @@ Open <http://localhost:5173>.
 - Front-end model cards and the token/s figures only appear once a model has actually been used. LiteLLM doesn't export metrics for a model until it handles a request, and Prismschism records changes between scrapes, so a request shows up one scrape (about 15 seconds) after it happens. If the dashboard looks empty, send a request through your proxy.
 - Charts fill in as history accumulates.
 
+### Upgrading an existing deployment
+
+Schema changes ship as SQL files in `infra/db/migrations/` and are applied by a one-shot `db-migrate` service that runs automatically on every `docker compose up` (the scraper waits for it). Migrations are tracked in a `prismschism_migrations` ledger table and are atomic per file: a failing migration rolls back completely, never leaves the database half-applied, and is retried on the next `up` once fixed.
+
+- **Existing installs** (created before migrations existed) are auto-baselined: if your database already has the pre-migrator schema, migrations `001`–`008` are recorded as applied and only `009`+ actually run.
+- **To run migrations on demand** (e.g. with a custom compose file, or against a remote database), invoke the script manually:
+
+  ```bash
+  docker compose run --rm db-migrate
+  ```
+
+  Without Compose, from the repo root:
+
+  ```bash
+  docker run --rm --network host \
+    -v "$PWD/infra/db/migrations:/migrations:ro" \
+    -v "$PWD/infra/db/migrate.sh:/migrate.sh:ro" \
+    -e DB_HOST=127.0.0.1 -e POSTGRES_DB=litellm -e POSTGRES_USER=litellm \
+    -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+    timescale/timescaledb:2.30.1-pg16 sh /migrate.sh
+  ```
+
+- The `db` service **no longer mounts** `infra/db/migrations` into `/docker-entrypoint-initdb.d`: that path only ever ran on an empty data volume, silently skipping schema upgrades on existing deployments, and would now double-apply files on fresh volumes. The migrator is the single path for schema.
+
 ### 4. Adjust docker-compose.yml (optional)
 
 Everything below is in `docker-compose.yml` or `.env`:
