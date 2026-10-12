@@ -27,6 +27,10 @@ import {
   buildBreakdownSql,
   buildBridgeSql,
   buildDerivedSql,
+  buildErrorCooldownSql,
+  buildErrorLaneWaitsSql,
+  buildErrorScrapeFailsSql,
+  buildErrorStateHealthSql,
   buildHealthSql,
   buildInflightSessionsByModelSql,
   buildKpiTotalRawSql,
@@ -53,8 +57,12 @@ import {
   RANGE_SECONDS,
   TIER_MAP,
   toBreakdown,
+  toCooldownEvents,
   toInflightModelGroups,
+  toLaneWaitEpisodes,
   toPoints,
+  toScrapeFailEvents,
+  toStateErrorEpisodes,
   tierForRange,
   TTFT_CLASSIFIER_AXES,
   validateBreakdownParams,
@@ -3131,5 +3139,417 @@ describe('toInflightModelGroups — byModel rows → contract items', () => {
       { modelId: 'group-a', distinct: 2 },
       { modelId: 'group-c', distinct: 0 },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/errors — unified error history (cooldowns, state episodes, lane
+// waits, scrape gaps). Four stored sources, one merged feed sorted ts DESC.
+// ---------------------------------------------------------------------------
+
+/**
+ * A `vi.fn()` fake `QueryFn` for /api/errors, which issues FOUR queries
+ * (counter deltas, deployment_health ticks, backend_lanes waiting ticks, and
+ * instance_health scrape failures). It dispatches on the SQL text so each
+ * source can be canned independently; `fail` names one source that rejects
+ * with a pg-style error carrying `code` (42P01 = undefined_table) to pin the
+ * missing-table tolerance.
+ */
+function makeErrorsQuery(spec: {
+  cooldown?: any[];
+  state?: any[];
+  lanes?: any[];
+  scrape?: any[];
+  fail?: 'cooldown' | 'state' | 'lanes' | 'scrape';
+  code?: string;
+}): FakeQuery {
+  return vi.fn(async (sql: string) => {
+    const which: 'cooldown' | 'state' | 'lanes' | 'scrape' = sql.includes('FROM counters')
+      ? 'cooldown'
+      : sql.includes('FROM deployment_health')
+        ? 'state'
+        : sql.includes('FROM backend_lanes')
+          ? 'lanes'
+          : 'scrape';
+    if (spec.fail === which) {
+      const err = new Error(`injected failure: ${which}`);
+      if (spec.code) (err as any).code = spec.code;
+      throw err;
+    }
+    return { rows: (spec[which] ?? []) as any[] };
+  }) as unknown as FakeQuery;
+}
+
+/** GET `${base}/api/errors?${qs}` and return status + parsed JSON body. */
+async function getErrors(base: string, qs: string): Promise<{ status: number; body: any }> {
+  const res = await fetch(`${base}/api/errors?${qs}`);
+  const body = await res.json();
+  return { status: res.status, body };
+}
+
+describe('GET /api/errors — integration', () => {
+  it('serves all four kinds, collapsed, sorted ts DESC, with the default 24h window bound in seconds', async () => {
+    const q = makeErrorsQuery({
+      // Already coalesced per (model_id, exception_status, minute) by SQL.
+      cooldown: [
+        { model_group: 'grp-a', exception_status: '429', bucket: '2026-10-12T10:07:00.000Z', max_delta: '3' },
+        { model_group: 'grp-b', exception_status: '500', bucket: '2026-10-12T10:05:00.000Z', max_delta: '1' },
+      ],
+      // Raw ticks (the episode collapsing happens in the mapper): m1 has a
+      // 3-tick error run broken by healthy, then a 1-tick run.
+      state: [
+        { ts: '2026-10-12T10:00:00.000Z', model_id: 'm1', status: 'error', model_group: 'grp-a' },
+        { ts: '2026-10-12T10:01:00.000Z', model_id: 'm1', status: 'error', model_group: 'grp-a' },
+        { ts: '2026-10-12T10:02:00.000Z', model_id: 'm1', status: 'error', model_group: 'grp-a' },
+        { ts: '2026-10-12T10:03:00.000Z', model_id: 'm1', status: 'healthy', model_group: 'grp-a' },
+        { ts: '2026-10-12T10:04:00.000Z', model_id: 'm1', status: 'error', model_group: 'grp-a' },
+      ],
+      // Raw 'waiting' ticks: a 2-tick run peaking at 5, a zero tick, then a
+      // 1-tick run peaking at 8.
+      lanes: [
+        { ts: '2026-10-12T09:00:00.000Z', backend: 'alpha', value: '2' },
+        { ts: '2026-10-12T09:01:00.000Z', backend: 'alpha', value: '5' },
+        { ts: '2026-10-12T09:02:00.000Z', backend: 'alpha', value: '0' },
+        { ts: '2026-10-12T09:05:00.000Z', backend: 'alpha', value: '8' },
+      ],
+      scrape: [{ ts: '2026-10-12T10:10:00.000Z', backend: 'beta' }],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getErrors(srv.base, '');
+      expect(status).toBe(200);
+      expect(body).toEqual({
+        errors: [
+          {
+            ts: '2026-10-12T10:10:00.000Z',
+            kind: 'scrape-fail',
+            subject: 'beta',
+            severity: 'warning',
+            count: 1,
+            detail:
+              "Our scraper could not fetch this target's metrics endpoint. " +
+              'The service itself may be fine — this is a monitoring gap, not proof of an outage.',
+          },
+          {
+            ts: '2026-10-12T10:07:00.000Z',
+            kind: 'cooldown',
+            subject: 'grp-a',
+            severity: 'error',
+            count: 3,
+            detail:
+              'HTTP 429 from the upstream while LiteLLM was routing a request — ' +
+              'the deployment was put on cooldown. Recurring under load means upstream capacity (lanes/KV cache) is too small.',
+          },
+          {
+            ts: '2026-10-12T10:05:00.000Z',
+            kind: 'cooldown',
+            subject: 'grp-b',
+            severity: 'error',
+            count: 1,
+            detail:
+              'HTTP 500 from the upstream while LiteLLM was routing a request — ' +
+              'the deployment was put on cooldown. Recurring under load means upstream capacity (lanes/KV cache) is too small.',
+          },
+          {
+            ts: '2026-10-12T10:04:00.000Z',
+            kind: 'state-error',
+            subject: 'grp-a',
+            severity: 'error',
+            count: 1,
+            detail:
+              'LiteLLM reported this deployment unhealthy for 1 consecutive scrape ticks. ' +
+              'Check the upstream process and its logs around this time.',
+          },
+          {
+            ts: '2026-10-12T10:00:00.000Z',
+            kind: 'state-error',
+            subject: 'grp-a',
+            severity: 'error',
+            count: 3,
+            detail:
+              'LiteLLM reported this deployment unhealthy for 3 consecutive scrape ticks. ' +
+              'Check the upstream process and its logs around this time.',
+          },
+          {
+            ts: '2026-10-12T09:05:00.000Z',
+            kind: 'lane-wait',
+            subject: 'alpha',
+            severity: 'warning',
+            count: 8,
+            detail:
+              'All 8 decode lanes were busy — requests queued at the inference server. ' +
+              'Sustained waiting means --parallel capacity is too small for the traffic.',
+          },
+          {
+            ts: '2026-10-12T09:00:00.000Z',
+            kind: 'lane-wait',
+            subject: 'alpha',
+            severity: 'warning',
+            count: 5,
+            detail:
+              'All 5 decode lanes were busy — requests queued at the inference server. ' +
+              'Sustained waiting means --parallel capacity is too small for the traffic.',
+          },
+        ],
+      });
+      expect(q).toHaveBeenCalledTimes(4);
+      // All four sources bind the default 24h window in SECONDS via $1.
+      for (const call of q.mock.calls) {
+        expect(call[1]).toEqual([86400]);
+      }
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('clamps windowHours into [1, 720] and limit into [1, 1000], truncating the OLDEST after sorting', async () => {
+    const q = makeErrorsQuery({
+      cooldown: [
+        { model_group: 'grp-a', exception_status: '429', bucket: '2026-10-12T10:07:00.000Z', max_delta: '3' },
+        { model_group: 'grp-a', exception_status: '500', bucket: '2026-10-12T10:05:00.000Z', max_delta: '1' },
+        { model_group: 'grp-a', exception_status: '503', bucket: '2026-10-12T10:01:00.000Z', max_delta: '2' },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      // Non-numeric windowHours -> 400 with NO query issued.
+      (q as any).mockClear();
+      const bad = await getErrors(srv.base, 'windowHours=abc');
+      expect(bad.status).toBe(400);
+      expect(typeof bad.body.error).toBe('string');
+      expect(q).not.toHaveBeenCalled();
+
+      // Non-numeric limit -> 400 with NO query issued.
+      (q as any).mockClear();
+      const badLimit = await getErrors(srv.base, 'limit=abc');
+      expect(badLimit.status).toBe(400);
+      expect(q).not.toHaveBeenCalled();
+
+      for (const [raw, seconds] of [
+        ['0', 3600],
+        ['-5', 3600],
+        ['99999', 720 * 3600],
+        ['48', 48 * 3600],
+      ] as const) {
+        (q as any).mockClear();
+        const { status } = await getErrors(srv.base, `windowHours=${raw}`);
+        expect(status).toBe(200);
+        for (const call of q.mock.calls) expect(call[1]).toEqual([seconds]);
+      }
+
+      // limit=2 keeps the two NEWEST events and drops the oldest.
+      (q as any).mockClear();
+      const { status, body } = await getErrors(srv.base, 'limit=2');
+      expect(status).toBe(200);
+      expect(body.errors.map((e: any) => e.ts)).toEqual([
+        '2026-10-12T10:07:00.000Z',
+        '2026-10-12T10:05:00.000Z',
+      ]);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('tolerates a missing counters table (42P01): 200 with no cooldown events and the rest intact', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeErrorsQuery({
+      fail: 'cooldown',
+      code: '42P01',
+      scrape: [{ ts: '2026-10-12T10:10:00.000Z', backend: 'beta' }],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getErrors(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.errors.map((e: any) => e.kind)).toEqual(['scrape-fail']);
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('counters table missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await srv.close();
+    }
+  });
+
+  it('tolerates a missing deployment_health table (42P01): 200 with no state-error events and the rest intact', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeErrorsQuery({
+      fail: 'state',
+      code: '42P01',
+      cooldown: [
+        { model_group: 'grp-a', exception_status: '429', bucket: '2026-10-12T10:07:00.000Z', max_delta: '3' },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getErrors(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.errors.map((e: any) => e.kind)).toEqual(['cooldown']);
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('deployment_health table missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await srv.close();
+    }
+  });
+
+  it('tolerates a missing backend_lanes table (42P01): 200 with no lane-wait events and the rest intact', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeErrorsQuery({
+      fail: 'lanes',
+      code: '42P01',
+      scrape: [{ ts: '2026-10-12T10:10:00.000Z', backend: 'beta' }],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getErrors(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.errors.map((e: any) => e.kind)).toEqual(['scrape-fail']);
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('backend_lanes table missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await srv.close();
+    }
+  });
+
+  it('tolerates a missing instance_health table (42P01): 200 with no scrape-fail events and the rest intact', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeErrorsQuery({
+      fail: 'scrape',
+      code: '42P01',
+      cooldown: [
+        { model_group: 'grp-a', exception_status: '429', bucket: '2026-10-12T10:07:00.000Z', max_delta: '3' },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getErrors(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.errors.map((e: any) => e.kind)).toEqual(['cooldown']);
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('instance_health table missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await srv.close();
+    }
+  });
+
+  it('never serializes instance_health status text: a raw mock row carrying an http:// error cannot leak', async () => {
+    const q = makeErrorsQuery({
+      scrape: [
+        {
+          ts: '2026-10-12T10:10:00.000Z',
+          backend: 'beta',
+          up: false,
+          // The identity vector the guard suite exists for: the RAW row the
+          // fake hands back carries the scraper's fetch-error text with the
+          // target URL. The mapper whitelists ts+backend, so NONE of it can
+          // reach the payload.
+          status: 'Get "http://192.0.2.50:9400/metrics": context deadline exceeded',
+        },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getErrors(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.errors).toHaveLength(1);
+      expect(body.errors[0].kind).toBe('scrape-fail');
+      expect(body.errors[0].subject).toBe('beta');
+      const raw = JSON.stringify(body);
+      expect(raw).not.toContain('http://');
+      expect(raw).not.toContain('192.0.2.50');
+      expect(raw).not.toContain('deadline');
+      expect(raw).not.toContain('"status"');
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
+describe('buildError*Sql — parameterized windows, ghost-filter, redaction-by-construction', () => {
+  it('cooldown SQL computes lag deltas, coalesces to 1-minute max buckets, ghost-filters via deployment_inventory', () => {
+    const sql = buildErrorCooldownSql();
+    expect(sql).toContain("now() - ($1 * interval '1 second')");
+    expect(sql).toContain('lag(value) OVER (PARTITION BY model_id, exception_status ORDER BY ts)');
+    expect(sql).toContain("date_trunc('minute', ts)");
+    expect(sql).toContain('max(delta) AS max_delta');
+    // Ghost-filter: inner inventory join, api_base identity check, no raw
+    // None/'' model_ids — the buildInflightSessionsByModelSql discipline.
+    expect(sql).toContain('JOIN deployment_inventory i ON i.model_id = d.model_id');
+    expect(sql).toContain("COALESCE(i.api_base, '') <> ''");
+    expect(sql).toContain("model_id <> 'None'");
+  });
+
+  it('state SQL selects every tick (not DISTINCT ON) ordered for island collapsing, ghost-filtered the same way', () => {
+    const sql = buildErrorStateHealthSql();
+    expect(sql).toContain("now() - ($1 * interval '1 second')");
+    expect(sql).toContain('ORDER BY h.model_id, h.ts ASC');
+    expect(sql).not.toContain('DISTINCT ON');
+    expect(sql).toContain('JOIN deployment_inventory i ON i.model_id = h.model_id');
+    expect(sql).toContain("COALESCE(i.api_base, '') <> ''");
+    expect(sql).toContain("model_id <> 'None'");
+  });
+
+  it('lane SQL reads only waiting ticks ordered per backend; nothing interpolated', () => {
+    const sql = buildErrorLaneWaitsSql();
+    expect(sql).toContain("now() - ($1 * interval '1 second')");
+    expect(sql).toContain("metric = 'waiting'");
+    expect(sql).toContain('ORDER BY backend, ts ASC');
+    expect(sql).not.toContain('$2');
+  });
+
+  it('scrape-fail SQL selects ONLY ts and backend from instance_health — never the raw status text', () => {
+    const sql = buildErrorScrapeFailsSql();
+    expect(sql).toContain('SELECT ts, backend');
+    expect(sql).toContain('FROM instance_health');
+    expect(sql).toContain("now() - ($1 * interval '1 second')");
+    expect(sql).toContain('up IS FALSE');
+    expect(sql.toLowerCase()).not.toContain('status');
+    expect(sql.toLowerCase()).not.toContain('select *');
+    expect(sql).not.toMatch(/,\s*\*/);
+  });
+});
+
+describe('toStateErrorEpisodes / toLaneWaitEpisodes — island collapsing units', () => {
+  it('state: contiguous error ticks per model_id collapse; a healthy tick or a model_id change breaks the run', () => {
+    const events = toStateErrorEpisodes([
+      { ts: '2026-10-12T10:00:00.000Z', model_id: 'm1', status: 'error', model_group: 'grp-a' },
+      { ts: '2026-10-12T10:02:00.000Z', model_id: 'm2', status: 'error', model_group: 'grp-a' },
+      { ts: '2026-10-12T10:01:00.000Z', model_id: 'm1', status: 'error', model_group: 'grp-a' },
+      { ts: '2026-10-12T10:03:00.000Z', model_id: 'm1', status: 'healthy', model_group: 'grp-a' },
+      { ts: '2026-10-12T10:04:00.000Z', model_id: 'm1', status: 'error', model_group: 'grp-a' },
+    ]);
+    // Events emit in island order (per model_id, then ts); the handler applies
+    // the final ts-DESC sort across all sources.
+    expect(events.map((e) => [e.ts, e.subject, e.count])).toEqual([
+      ['2026-10-12T10:00:00.000Z', 'grp-a', 2],
+      ['2026-10-12T10:04:00.000Z', 'grp-a', 1],
+      ['2026-10-12T10:02:00.000Z', 'grp-a', 1],
+    ]);
+  });
+
+  it('lanes: contiguous waiting>0 ticks collapse with peak; a zero tick breaks the run; unsorted input tolerated', () => {
+    const events = toLaneWaitEpisodes([
+      { ts: '2026-10-12T09:05:00.000Z', backend: 'alpha', value: '8' },
+      { ts: '2026-10-12T09:00:00.000Z', backend: 'alpha', value: '2' },
+      { ts: '2026-10-12T09:02:00.000Z', backend: 'alpha', value: '0' },
+      { ts: '2026-10-12T09:01:00.000Z', backend: 'alpha', value: '5' },
+    ]);
+    expect(events.map((e) => [e.ts, e.count, e.severity])).toEqual([
+      ['2026-10-12T09:00:00.000Z', 5, 'warning'],
+      ['2026-10-12T09:05:00.000Z', 8, 'warning'],
+    ]);
+  });
+
+  it('cooldown: rows map 1:1 to events with the verbatim template and numeric coercion', () => {
+    const events = toCooldownEvents([
+      { model_group: 'grp-a', exception_status: '429', bucket: '2026-10-12T10:07:00.000Z', max_delta: '3' },
+      { model_group: 'grp-b', exception_status: null, bucket: '2026-10-12T10:05:00.000Z', max_delta: 'oops' },
+    ]);
+    expect(events[0]).toMatchObject({ kind: 'cooldown', subject: 'grp-a', severity: 'error', count: 3 });
+    expect(events[0].detail).toContain('HTTP 429 from the upstream');
+    expect(events[1].count).toBe(0);
+    expect(events[1].detail).toContain('HTTP unknown from the upstream');
   });
 });

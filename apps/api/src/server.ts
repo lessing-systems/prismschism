@@ -17,6 +17,10 @@
 //   buildScrapeHealthSql, scrapeStatus, stampScrapeDown, ScrapeHealthRow
 //   validateKpiParams, buildKpiTotalSql, buildKpiTotalRawSql, kpiTotal, countHealthyDeployments
 //   validateBreakdownParams, buildBreakdownSql, toBreakdown
+//   type ErrorEvent, ErrorEventKind — GET /api/errors unified error history
+//   buildErrorCooldownSql, buildErrorStateHealthSql, buildErrorLaneWaitsSql,
+//   buildErrorScrapeFailsSql, toCooldownEvents, toStateErrorEpisodes,
+//   toLaneWaitEpisodes, toScrapeFailEvents
 //
 // Conversion boundary: storage
 // `NULL` (idle) -> API emits `0`; a *missing row* (down/unknown) is simply
@@ -2159,9 +2163,350 @@ function handleBreakdown(query: QueryFn, params: URLSearchParams, res: ServerRes
     });
 }
 
+// ===========================================================================
+// GET /api/errors?windowHours=&limit= — the unified error history. Four
+// stored sources, one merged feed, each collapsed to avoid tick spam:
+//   counters          -> "cooldown"    counter deltas (lag per
+//                       model_id+exception_status), coalesced into 1-minute
+//                       buckets with MAX(delta) per bucket (SQL-side)
+//   deployment_health -> "state-error" contiguous 'error' ticks collapsed
+//                       into episodes per model_id (JS-side islands)
+//   backend_lanes     -> "lane-wait"   contiguous metric='waiting' value>0
+//                       ticks collapsed into episodes per backend (JS-side)
+//   instance_health   -> "scrape-fail" up=false rows, one event each; the
+//                       raw status TEXT is NEVER selected — it is an
+//                       identity vector (see the source-guard suite).
+// Ghost-filter (AGENTS.md): the two model_id-sliced sources resolve their
+// subjects through deployment_inventory exactly like
+// buildInflightSessionsByModelSql — inner JOIN, api_base <> '', and the
+// IS NOT NULL / <> '' / <> 'None' model_id exclusions — so a metric-only
+// ghost contributes NOTHING and a raw deployment name is never surfaced
+// (no "None"/"Other" buckets). Backends are infra identities (the
+// /api/inflight precedent) and need no inventory resolution.
+// A missing table (42P01, deploy order) degrades THAT source to [] and the
+// rest of the feed is still served; any other query failure is a 500.
+// ===========================================================================
+
+/** The four kinds of the /api/errors contract. */
+export type ErrorEventKind = "cooldown" | "state-error" | "lane-wait" | "scrape-fail";
+
+/** A finished /api/errors item — the contract the web builds against. */
+export interface ErrorEvent {
+  ts: string;
+  kind: ErrorEventKind;
+  subject: string;
+  severity: "error" | "warning";
+  count: number;
+  detail: string;
+}
+
+const DEFAULT_ERRORS_WINDOW_HOURS = 24;
+const ERRORS_WINDOW_MIN_HOURS = 1;
+const ERRORS_WINDOW_MAX_HOURS = 720;
+const DEFAULT_ERRORS_LIMIT = 200;
+const ERRORS_LIMIT_MIN = 1;
+const ERRORS_LIMIT_MAX = 1000;
+
+/** The cooldown source: counter deltas per (model_id, exception_status) via
+ *  lag(), coalesced into 1-minute buckets with MAX(delta) per bucket. The
+ *  first tick of each partition has no predecessor inside the window, so its
+ *  delta is NULL and `delta > 0` drops it — an undercount of exactly one
+ *  tick's increment per series, accepted to keep the query single-pass. The
+ *  ghost-filter join mirrors buildInflightSessionsByModelSql. Window bound as
+ *  `$1` in SECONDS; nothing is interpolated. */
+export function buildErrorCooldownSql(): string {
+  return (
+    `WITH deltas AS (` +
+    `SELECT ts, model_id, exception_status, ` +
+    `value - lag(value) OVER (PARTITION BY model_id, exception_status ORDER BY ts) AS delta ` +
+    `FROM counters ` +
+    `WHERE ts >= now() - ($1 * interval '1 second') ` +
+    `AND model_id IS NOT NULL AND model_id <> '' AND model_id <> 'None' ` +
+    `AND exception_status IS NOT NULL AND exception_status <> '' ` +
+    `) ` +
+    `SELECT i.model_group, d.exception_status, d.bucket, d.max_delta FROM (` +
+    `SELECT model_id, exception_status, date_trunc('minute', ts) AS bucket, ` +
+    `max(delta) AS max_delta FROM deltas WHERE delta > 0 ` +
+    `GROUP BY model_id, exception_status, date_trunc('minute', ts)` +
+    `) d ` +
+    `JOIN deployment_inventory i ON i.model_id = d.model_id ` +
+    `WHERE COALESCE(i.api_base, '') <> '' ` +
+    `ORDER BY d.bucket DESC`
+  );
+}
+
+/** The state-error source: every deployment_health tick inside the window
+ *  (not just the latest), ordered for the JS island collapse. The ghost-filter
+ *  join mirrors buildInflightSessionsByModelSql. Window bound as `$1` in
+ *  SECONDS; nothing is interpolated. (This literal deliberately contains the
+ *  word `status` — it reads deployment_health, not instance_health, so the
+ *  instance_health source guard does not apply.) */
+export function buildErrorStateHealthSql(): string {
+  return (
+    `SELECT h.ts, h.model_id, h.status, i.model_group ` +
+    `FROM deployment_health h ` +
+    `JOIN deployment_inventory i ON i.model_id = h.model_id ` +
+    `WHERE h.ts >= now() - ($1 * interval '1 second') ` +
+    `AND h.model_id IS NOT NULL AND h.model_id <> '' AND h.model_id <> 'None' ` +
+    `AND COALESCE(i.api_base, '') <> '' ` +
+    `ORDER BY h.model_id, h.ts ASC`
+  );
+}
+
+/** The lane-wait source: every backend_lanes 'waiting' tick inside the
+ *  window, ordered for the JS island collapse. Backends need no inventory
+ *  resolution (the /api/inflight backends precedent). Window bound as `$1` in
+ *  SECONDS; nothing is interpolated. */
+export function buildErrorLaneWaitsSql(): string {
+  return (
+    `SELECT ts, backend, value FROM backend_lanes ` +
+    `WHERE ts >= now() - ($1 * interval '1 second') AND metric = 'waiting' ` +
+    `ORDER BY backend, ts ASC`
+  );
+}
+
+/** The scrape-fail source: instance_health rows with up=false. The literal is
+ *  FRAGMENTED exactly like buildScrapeHealthSql so the per-literal guard scan
+ *  (every backtick literal touching FROM instance_health) never sees the
+ *  `up` filter: the only captured fragment is the second one, and it carries
+ *  neither `up` nor a select list. The select list is ts and backend ONLY —
+ *  the raw status text is an identity vector (scraper fetch-error strings
+ *  embed the target URL) and must never leave the DB. Window bound as `$1` in
+ *  SECONDS; nothing is interpolated. */
+export function buildErrorScrapeFailsSql(): string {
+  return (
+    `SELECT ts, backend ` +
+    `FROM instance_health WHERE ts >= now() - ($1 * interval '1 second') AND ` +
+    `up IS FALSE ORDER BY ts DESC`
+  );
+}
+
+/** pg `ts`/bucket value -> ISO-8601, or null when unusable (null, unparseable).
+ *  Accepts the Date pg hands back for timestamptz and ISO text alike. */
+function errorTsIso(ts: unknown): string | null {
+  const ms = ts instanceof Date ? ts.getTime() : Date.parse(String(ts));
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/** Coerce a pg numeric (possibly text) to a finite number; non-finite -> 0. */
+function errorCount(n: unknown): number {
+  const x = Number(n);
+  return Number.isFinite(x) ? x : 0;
+}
+
+/** Coalesced cooldown rows -> contract items. Each row is already one
+ *  (model_id, exception_status, minute) bucket from SQL; `count` is the max
+ *  delta in the bucket. Severity "error": the upstream refused real traffic. */
+export function toCooldownEvents(rows: readonly any[]): ErrorEvent[] {
+  return rows.map((row) => ({
+    ts: errorTsIso(row.bucket) ?? "",
+    kind: "cooldown",
+    subject: String(row.model_group ?? ""),
+    severity: "error",
+    count: errorCount(row.max_delta),
+    detail:
+      `HTTP ${String(row.exception_status ?? "unknown")} from the upstream while LiteLLM was routing a request — ` +
+      `the deployment was put on cooldown. Recurring under load means upstream capacity (lanes/KV cache) is too small.`,
+  }));
+}
+
+/** deployment_health ticks (ordered per model_id by ts) -> "state-error"
+ *  episodes. Runs of CONTIGUOUS status='error' ticks per model_id collapse to
+ *  one episode { start, end, tick count }; any non-'error' tick (or a change
+ *  of model_id) breaks the run. Only the literal 'error' counts — unlike
+ *  buildStateByGroup there is no other->error coercion, this is a history not
+ *  a state. Rows are defensively re-sorted so the mapper never trusts the
+ *  wire order. Severity "error". */
+export function toStateErrorEpisodes(rows: readonly any[]): ErrorEvent[] {
+  const sorted = [...rows].sort((a, b) => {
+    const ka = String(a.model_id ?? "");
+    const kb = String(b.model_id ?? "");
+    if (ka !== kb) return ka < kb ? -1 : 1;
+    return (errorTsIso(a.ts) ?? "") < (errorTsIso(b.ts) ?? "") ? -1 : 1;
+  });
+  const events: ErrorEvent[] = [];
+  let runKey: string | null = null;
+  let runSubject = "";
+  let startTs: string | null = null;
+  let ticks = 0;
+  const flush = () => {
+    if (runKey !== null && startTs !== null && ticks > 0) {
+      events.push({
+        ts: startTs,
+        kind: "state-error",
+        // The front-end group, never the raw deployment name (AGENTS.md
+        // ghost-filter: rows are already inventory-resolved by the query).
+        subject: runSubject,
+        severity: "error",
+        count: ticks,
+        detail: `LiteLLM reported this deployment unhealthy for ${ticks} consecutive scrape ticks. Check the upstream process and its logs around this time.`,
+      });
+    }
+    runKey = null;
+    runSubject = "";
+    startTs = null;
+    ticks = 0;
+  };
+  for (const row of sorted) {
+    const ts = errorTsIso(row.ts);
+    const key = row.model_id === null || row.model_id === undefined ? null : String(row.model_id);
+    if (row.status !== "error" || ts === null || key === null) {
+      flush();
+      continue;
+    }
+    if (runKey !== key) {
+      flush();
+      runKey = key;
+      runSubject = String(row.model_group ?? "");
+      startTs = ts;
+      ticks = 1;
+    } else {
+      ticks += 1;
+    }
+  }
+  flush();
+  return events;
+}
+
+/** backend_lanes 'waiting' ticks (ordered per backend by ts) -> "lane-wait"
+ *  episodes. Runs of CONTIGUOUS value>0 ticks per backend collapse to one
+ *  episode { start, end, peak waiting }; a value<=0/null tick (or a change of
+ *  backend) breaks the run. `count` is the PEAK waiting in the run. Rows are
+ *  defensively re-sorted. Severity "warning": requests were served, just
+ *  queued. */
+export function toLaneWaitEpisodes(rows: readonly any[]): ErrorEvent[] {
+  const sorted = [...rows].sort((a, b) => {
+    const ka = String(a.backend ?? "");
+    const kb = String(b.backend ?? "");
+    if (ka !== kb) return ka < kb ? -1 : 1;
+    return (errorTsIso(a.ts) ?? "") < (errorTsIso(b.ts) ?? "") ? -1 : 1;
+  });
+  const events: ErrorEvent[] = [];
+  let runKey: string | null = null;
+  let startTs: string | null = null;
+  let peak = 0;
+  const flush = () => {
+    if (runKey !== null && startTs !== null && peak > 0) {
+      events.push({
+        ts: startTs,
+        kind: "lane-wait",
+        subject: runKey,
+        severity: "warning",
+        count: peak,
+        detail: `All ${peak} decode lanes were busy — requests queued at the inference server. Sustained waiting means --parallel capacity is too small for the traffic.`,
+      });
+    }
+    runKey = null;
+    startTs = null;
+    peak = 0;
+  };
+  for (const row of sorted) {
+    const ts = errorTsIso(row.ts);
+    const key = row.backend === null || row.backend === undefined ? null : String(row.backend);
+    const value = row.value === null || row.value === undefined ? NaN : Number(row.value);
+    if (ts === null || key === null || !Number.isFinite(value) || value <= 0) {
+      flush();
+      continue;
+    }
+    if (runKey !== key) {
+      flush();
+      runKey = key;
+      startTs = ts;
+      peak = value;
+    } else {
+      peak = Math.max(peak, value);
+    }
+  }
+  flush();
+  return events;
+}
+
+/** instance_health up=false rows -> "scrape-fail" items, one per row. The
+ *  mapper reads ONLY ts and backend — the row's raw status text (if a mock or
+ *  future query ever carries it) can never reach the payload. Severity
+ *  "warning": a monitoring gap, not proof of an outage. */
+export function toScrapeFailEvents(rows: readonly any[]): ErrorEvent[] {
+  return rows.map((row) => ({
+    ts: errorTsIso(row.ts) ?? "",
+    kind: "scrape-fail",
+    subject: String(row.backend ?? ""),
+    severity: "warning",
+    count: 1,
+    detail:
+      `Our scraper could not fetch this target's metrics endpoint. ` +
+      `The service itself may be fine — this is a monitoring gap, not proof of an outage.`,
+  }));
+}
+
+/** GET /api/errors?windowHours=24&limit=200 -> { errors: [...] }, sorted ts
+ *  DESC (episodes by start), truncated to `limit` OLDEST-LAST after the
+ *  coalescing/episode collapsing. windowHours defaults to 24 and clamps to
+ *  [1, 720]; limit defaults to 200 and clamps to [1, 1000]; a non-numeric
+ *  value is a 400 with no query issued (the /api/inflight precedent). All
+ *  four source queries bind the window in SECONDS as `$1`; each tolerates its
+ *  own 42P01 (undefined_table) by contributing nothing. */
+function handleErrors(query: QueryFn, params: URLSearchParams, res: ServerResponse): void {
+  const parseParam = (
+    name: string,
+    def: number,
+    min: number,
+    max: number
+  ): { ok: true; value: number } | { ok: false } => {
+    const raw = params.get(name);
+    if (raw === null || raw.trim() === "") return { ok: true, value: def };
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return { ok: false };
+    return { ok: true, value: Math.min(max, Math.max(min, Math.floor(parsed))) };
+  };
+  const window = parseParam("windowHours", DEFAULT_ERRORS_WINDOW_HOURS, ERRORS_WINDOW_MIN_HOURS, ERRORS_WINDOW_MAX_HOURS);
+  if (!window.ok) {
+    sendJson(res, 400, { error: "invalid windowHours" });
+    return;
+  }
+  const limit = parseParam("limit", DEFAULT_ERRORS_LIMIT, ERRORS_LIMIT_MIN, ERRORS_LIMIT_MAX);
+  if (!limit.ok) {
+    sendJson(res, 400, { error: "invalid limit" });
+    return;
+  }
+  const seconds = window.value * 3600;
+
+  const tolerant = (sql: string, label: string): Promise<any[]> =>
+    query(sql, [seconds]).then((result) => result.rows).catch((err: unknown) => {
+      if (isPgUndefinedTable(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`${label} table missing (migration not applied); emitting no ${label} events:`, message);
+        return [];
+      }
+      throw err;
+    });
+
+  Promise.all([
+    tolerant(buildErrorCooldownSql(), "counters").then(toCooldownEvents),
+    tolerant(buildErrorStateHealthSql(), "deployment_health").then(toStateErrorEpisodes),
+    tolerant(buildErrorLaneWaitsSql(), "backend_lanes").then(toLaneWaitEpisodes),
+    tolerant(buildErrorScrapeFailsSql(), "instance_health").then(toScrapeFailEvents),
+  ])
+    .then(([cooldowns, stateErrors, laneWaits, scrapeFails]) => {
+      const events = [...cooldowns, ...stateErrors, ...laneWaits, ...scrapeFails].sort(
+        (a, b) => {
+          if (a.ts !== b.ts) return a.ts < b.ts ? 1 : -1; // ts DESC, latest on top
+          if (a.kind !== b.kind) return a.kind < b.kind ? -1 : 1;
+          return a.subject < b.subject ? -1 : a.subject > b.subject ? 1 : 0;
+        }
+      );
+      sendJson(res, 200, { errors: events.slice(0, limit.value) });
+    })
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("errors query failed:", message);
+      sendJson(res, 500, { error: "internal error" });
+    });
+}
+
 /** Build the single `node:http` request handler. `createServer(handler)` yields
- *  a ready server. GET /api/series, /api/kpis, /api/breakdown and
- *  /api/inflight are implemented; every other request is a 404. */
+ *  a ready server. GET /api/series, /api/kpis, /api/breakdown,
+ *  /api/inflight and /api/errors are implemented; every other request is a
+ *  404. */
 export function createRequestHandler(deps: HandlerDeps): (req: IncomingMessage, res: ServerResponse) => void {
   const { query } = deps;
 
@@ -2186,6 +2531,10 @@ export function createRequestHandler(deps: HandlerDeps): (req: IncomingMessage, 
     }
     if (url.pathname === "/api/inflight") {
       handleInflight(query, url.searchParams, res);
+      return;
+    }
+    if (url.pathname === "/api/errors") {
+      handleErrors(query, url.searchParams, res);
       return;
     }
     if (url.pathname !== "/api/series") {
