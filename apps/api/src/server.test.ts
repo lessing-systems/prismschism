@@ -440,23 +440,28 @@ describe('exported reference constants', () => {
 
 describe('deployment health state', () => {
   describe('buildHealthSql — SQL construction', () => {
-    it('selects the latest health row per (model_id, litellm_model_name) in the look-back window', () => {
+    it('selects the latest health row per model_id in the look-back window (spelling-independent)', () => {
       const sql = buildHealthSql();
       expect(sql).toContain('FROM deployment_health');
-      expect(sql).toContain('DISTINCT ON (model_id, litellm_model_name)');
+      expect(sql).toContain('DISTINCT ON (model_id)');
       expect(sql).toContain("ts >= now() - ($1 * interval '1 second')");
-      expect(sql).toContain('ORDER BY model_id, litellm_model_name, ts DESC');
+      expect(sql).toContain('ORDER BY model_id, ts DESC');
+      // litellm_model_name is still projected (label stamping reads it) but
+      // must never split the latest-row decision.
+      expect(sql).toContain('litellm_model_name');
+      expect(sql).not.toContain('DISTINCT ON (model_id, litellm_model_name)');
+      expect(sql).not.toContain('ORDER BY model_id, litellm_model_name');
     });
   });
 
   describe('buildStateByGroup — health rows → group state map', () => {
-    it('maps a row to both model_id and litellm_model_name keys', () => {
+    it('keys the map by model_id only (litellm_model_name is no longer a state key)', () => {
       const rows = [
         { model_id: 'gpt-4', litellm_model_name: 'gpt-4-prod', status: 'error' },
       ];
       const map = buildStateByGroup(rows);
       expect(map.get('gpt-4')).toBe('error');
-      expect(map.get('gpt-4-prod')).toBe('error');
+      expect(map.get('gpt-4-prod')).toBeUndefined();
     });
 
     it('maps unknown/other status values to "error"', () => {
@@ -465,7 +470,6 @@ describe('deployment health state', () => {
       ];
       const map = buildStateByGroup(rows);
       expect(map.get('gpt-4')).toBe('error');
-      expect(map.get('gpt-4-prod')).toBe('error');
     });
 
     it('ignores rows whose status is null (the key is absent)', () => {
@@ -474,10 +478,28 @@ describe('deployment health state', () => {
       ];
       const map = buildStateByGroup(rows);
       expect(map.get('gpt-4')).toBeUndefined();
-      expect(map.get('gpt-4-prod')).toBeUndefined();
     });
 
-    it('keeps the worst state when a group appears with several states', () => {
+    it('follows the LATEST row per model_id: a newer healthy row under a renamed spelling heals an older error', () => {
+      // glm53 regression pin: the Oct 11 outage wrote error rows under one
+      // litellm_model_name spelling; healthy rows now arrive under another.
+      // The state must follow the newest row, not the worst across spellings.
+      const rows = [
+        { model_id: 'glm-5.3', litellm_model_name: 'deploy-old-spelling', status: 'error', ts: '2026-10-11T00:00:00.000Z' },
+        { model_id: 'glm-5.3', litellm_model_name: 'deploy-new-spelling', status: 'healthy', ts: '2026-10-12T00:00:00.000Z' },
+      ];
+      expect(buildStateByGroup(rows).get('glm-5.3')).toBe('healthy');
+    });
+
+    it('follows the LATEST row per model_id: a newer error beats an older healthy row', () => {
+      const rows = [
+        { model_id: 'glm-5.3', litellm_model_name: 'deploy-old-spelling', status: 'healthy', ts: '2026-10-11T00:00:00.000Z' },
+        { model_id: 'glm-5.3', litellm_model_name: 'deploy-new-spelling', status: 'error', ts: '2026-10-12T00:00:00.000Z' },
+      ];
+      expect(buildStateByGroup(rows).get('glm-5.3')).toBe('error');
+    });
+
+    it('ties (or absent ts) fall back to worst-wins per model_id', () => {
       const base = [
         { model_id: 'm1', litellm_model_name: 'a', status: 'healthy' },
         { model_id: 'm1', litellm_model_name: 'b', status: 'prefill' },
@@ -802,7 +824,9 @@ describe('attachStates — request label → deployment state via the bridge map
       { model_id: 'mid-1', litellm_model_name: 'deploy-a', status: 'error' },
     ]);
     const labelToModelIds = new Map<string, string[]>();
-    const points: SeriesPoint[] = [{ t: '2026-09-29T10:00:00.000Z', group: 'deploy-a', value: 10 }];
+    // The state map is keyed by model_id only, so the direct fallback resolves
+    // when the label already IS the model_id.
+    const points: SeriesPoint[] = [{ t: '2026-09-29T10:00:00.000Z', group: 'mid-1', value: 10 }];
 
     const out = attachStates(points, stateByGroup, labelToModelIds);
 
@@ -867,7 +891,7 @@ describe('attachStates — request label → deployment state via the bridge map
     const labelToModelIds = new Map<string, string[]>([['req-label', ['mid-1']]]);
     const points: SeriesPoint[] = [
       { t: '2026-09-29T10:00:00.000Z', group: 'req-label', value: 10 },
-      { t: '2026-09-29T10:05:00.000Z', group: 'deploy-a', value: 20 },
+      { t: '2026-09-29T10:05:00.000Z', group: 'mid-1', value: 20 },
     ];
 
     const out = attachStates(points, stateByGroup, labelToModelIds);
@@ -2034,7 +2058,7 @@ describe('GET /api/series — activity state machine integration', () => {
     const q = makeDispatchingQuery(
       [{ bucket, model: 'gpt-4', value: '10' }],
       [{ model_id: 'mid-1', litellm_model_name: 'gpt-4', status: 'error' }],
-      [{ model: 'gpt-4', model_id: 'mid-1' }],
+      [{ label: 'gpt-4', model_id: 'mid-1' }],
       [{ bucket, grp: 'gpt-4', out_inc: 0, req_inc: 0, ttft_inc: 0 }],
     );
     const srv = await startServer(q);
@@ -2082,7 +2106,7 @@ describe('GET /api/series — activity state machine integration', () => {
     const q = makeDispatchingQuery(
       [{ bucket, model: 'gpt-4', value: '10' }],
       [{ model_id: 'mid-1', litellm_model_name: 'gpt-4', status: 'error' }],
-      [{ model: 'gpt-4', model_id: 'mid-1' }],
+      [{ label: 'gpt-4', model_id: 'mid-1' }],
       [],
     );
     const srv = await startServer(q);
@@ -2156,7 +2180,7 @@ describe('GET /api/series — activity state machine integration', () => {
     const q = makeDispatchingQuery(
       [{ bucket, model: 'gpt-4', value: '10' }],
       [{ model_id: 'mid-1', litellm_model_name: 'gpt-4', status: 'healthy' }],
-      [{ model: 'gpt-4', model_id: 'mid-1' }],
+      [{ label: 'gpt-4', model_id: 'mid-1' }],
       [{ bucket, grp: 'gpt-4', out_inc: 0, req_inc: 0, ttft_inc: 0 }],
     );
     const srv = await startServer(q);

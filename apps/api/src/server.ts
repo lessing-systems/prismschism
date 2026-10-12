@@ -947,12 +947,16 @@ export type ActivityState = "healthy" | "prefill" | "idle";
  *  health states plus the activity `idle`. */
 export type PointState = DeploymentState | ActivityState;
 
-/** A raw `deployment_health` row as returned by pg. All three keys are optional/
- *  nullable — a malformed row (null status or missing keys) is ignored. */
+/** A raw `deployment_health` row as returned by pg. All keys are optional/
+ *  nullable — a malformed row (null status or missing keys) is ignored. `ts`
+ *  is the row's write time (pg parses timestamptz to a Date); it breaks the
+ *  latest-row-wins tie so a renamed `litellm_model_name` spelling cannot keep
+ *  a stale state alive. */
 export interface HealthRow {
   model_id: string | null;
   litellm_model_name: string | null;
   status: string | null;
+  ts?: unknown;
 }
 
 /** Severity ordering used to resolve the worst state when a group maps to
@@ -961,25 +965,49 @@ export interface HealthRow {
 const STATE_RANK: Record<PointState, number> = { idle: 0, healthy: 1, prefill: 2, error: 3 };
 
 /** Build the deployment-health query. Selects the LATEST health row per
- *  (model_id, litellm_model_name) within the look-back window, which is bound
- *  as `$1` (seconds). `model_id`/`litellm_model_name` are fixed, whitelisted
- *  column names from the documented table contract — never user input. */
+ *  `model_id` — NOT per (model_id, litellm_model_name) spelling — within the
+ *  look-back window bound as `$1` (seconds). A renamed deployment label must
+ *  not resurrect a stale state: only the newest row of the deployment survives,
+ *  whichever spelling it carries. `litellm_model_name` is still projected (the
+ *  model_id-grouped label stamping reads it) but never splits the latest-row
+ *  decision. `model_id`/`litellm_model_name` are fixed, whitelisted column
+ *  names from the documented table contract — never user input. */
 export function buildHealthSql(): string {
   return (
-    `SELECT DISTINCT ON (model_id, litellm_model_name) model_id, litellm_model_name, status ` +
+    `SELECT DISTINCT ON (model_id) model_id, litellm_model_name, status, ts ` +
     `FROM deployment_health ` +
     `WHERE ts >= now() - ($1 * interval '1 second') ` +
-    `ORDER BY model_id, litellm_model_name, ts DESC`
+    `ORDER BY model_id, ts DESC`
   );
 }
 
-/** Health rows -> a map keyed by BOTH `model_id` and `litellm_model_name` (each
- *  row contributes to both keys). The value is the group's `DeploymentState`;
- *  when several rows map to the same key the WORST state wins. Contract:
- *  `healthy`/`prefill`/`error` map directly; any OTHER non-null status -> error;
- *  a null/missing status -> the row is ignored (its keys stay absent). */
+/** pg row `ts` -> comparable epoch ms; anything unusable (null, unparseable,
+ *  non-finite) ranks as -Infinity so it can never win a latest-row contest. */
+function healthRowTsMs(ts: unknown): number {
+  if (ts instanceof Date) {
+    const ms = ts.getTime();
+    return Number.isFinite(ms) ? ms : Number.NEGATIVE_INFINITY;
+  }
+  if (typeof ts === "number") return Number.isFinite(ts) ? ts : Number.NEGATIVE_INFINITY;
+  if (typeof ts === "string") {
+    const parsed = Date.parse(ts);
+    return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+  }
+  return Number.NEGATIVE_INFINITY;
+}
+
+/** Health rows -> a map keyed by `model_id` ONLY. Each row contributes to its
+ *  `model_id` key; when several rows share a `model_id` (e.g. one state per
+ *  `litellm_model_name` spelling) the row with the LATEST `ts` wins — the
+ *  deployment state follows the newest health row, so an old error written
+ *  under a stale spelling cannot pin itself after a newer healthy row under a
+ *  renamed spelling. When `ts` is absent or ties, the WORST state wins
+ *  (STATE_RANK order). Contract: `healthy`/`prefill`/`error` map directly; any
+ *  OTHER non-null status -> error; a null/missing status -> the row is ignored
+ *  (its key stays absent). */
 export function buildStateByGroup(rows: readonly HealthRow[]): Map<string, DeploymentState> {
   const map = new Map<string, DeploymentState>();
+  const tsByGroup = new Map<string, number>();
   for (const row of rows) {
     const status = row.status;
     let state: DeploymentState;
@@ -990,11 +1018,18 @@ export function buildStateByGroup(rows: readonly HealthRow[]): Map<string, Deplo
     } else {
       state = "error"; // contract: other -> error
     }
-    for (const key of [row.model_id, row.litellm_model_name]) {
-      if (key === null || key === undefined) continue;
-      const k = String(key);
-      const prev = map.get(k);
-      if (!prev || STATE_RANK[state] > STATE_RANK[prev]) map.set(k, state);
+    const key = row.model_id;
+    if (key === null || key === undefined) continue;
+    const k = String(key);
+    const ts = healthRowTsMs(row.ts);
+    const prevTs = tsByGroup.get(k) ?? Number.NEGATIVE_INFINITY;
+    const prev = map.get(k);
+    if (
+      ts > prevTs ||
+      (ts === prevTs && (!prev || STATE_RANK[state] > STATE_RANK[prev]))
+    ) {
+      map.set(k, state);
+      tsByGroup.set(k, ts);
     }
   }
   return map;
@@ -1174,12 +1209,12 @@ export function buildLabelToModelIds(
  *  order per point (worst-wins within each authority, via STATE_RANK):
  *
  *  (a) DEPLOYMENT health: the point's `group` is a request-side label, looked up
- *  directly first (legacy: the label may already BE a `model_id` /
- *  `litellm_model_name`) and then through every `model_id` the bridge maps it to.
- *  The WORST deployment state across candidates that exist in `stateByGroup`
- *  wins (AMBIGUITY RULE: one label served by several deployments with differing
- *  states reports the worst — exactly how `buildStateByGroup` collapses several
- *  deployments onto one key).
+ *  directly first (legacy: the label may already BE a `model_id` — the state
+ *  map is keyed by `model_id` only) and then through every `model_id` the
+ *  bridge maps it to. The WORST deployment state across candidates that exist
+ *  in `stateByGroup` wins (AMBIGUITY RULE: one label served by several
+ *  deployments with differing states reports the worst — exactly how the
+ *  bridge collapses several deployments onto one label).
  *  (b) ERROR IS ABSOLUTE `deployment_health` is the error
  *  authority, so a resolved `error` is assigned and the point is done — no
  *  derived activity reading (idle/healthy/prefill) may ever mask a real error.
@@ -2302,8 +2337,8 @@ export function createRequestHandler(deps: HandlerDeps): (req: IncomingMessage, 
         const stateByGroup = buildStateByGroup(health.rows as HealthRow[]);
         // Request-side labels never appear in deployment_health, so resolve
         // state through the model_id bridge (direct label lookup still wins
-        // when the label already is a model_id / litellm_model_name). The
-        // per-bucket activity state (derived once from the out/req/ttft
+        // when the label already is a model_id — the state map is keyed by
+        // model_id only). The per-bucket activity state (derived once from the out/req/ttft
         // increments) takes precedence over a NON-error deployment state
         //
         // but can never override an error — error is absolute.
