@@ -13,7 +13,7 @@
 #   1. Waits for the database to accept connections (pg_isready, 60 s cap).
 #   2. Creates the ledger table `prismschism_migrations` if missing.
 #   3. Auto-baselines pre-migrator deployments: if `public.requests` already
-#      exists and the ledger is empty, 001-008 are recorded as applied (they are
+#      exists and the ledger is empty, 000-008 are recorded as applied (they are
 #      already present in those databases) so only 009+ are executed.
 #   4. Applies every infra/db/migrations/*.sql not yet in the ledger, in sorted
 #      order, each in its own single transaction (`psql -1`). A failing file
@@ -93,19 +93,20 @@ psql_query "CREATE TABLE IF NOT EXISTS $LEDGER (
 log "Ledger table $LEDGER ready."
 
 # --- 3. Auto-baseline pre-migrator deployments --------------------------------
-# Deployments created before this migrator existed already have 001-008 applied
-# (they came from /docker-entrypoint-initdb.d on a fresh volume). Recording them
-# in the ledger means only 009+ actually execute. 000_create_timescaledb.sql is
-# deliberately NOT baselined: it is just `CREATE EXTENSION IF NOT EXISTS
-# timescaledb`, so re-running it is a no-op.
+# Deployments created before this migrator existed already have everything
+# through 008 applied (they came from /docker-entrypoint-initdb.d on a fresh
+# volume); only 009+ apply. 000 is included because the timescaledb extension
+# already exists per-database on such deployments: leaving 000 pending would
+# make CREATE EXTENSION fail and roll back, blocking the scraper.
 
 has_requests="$(psql_query "SELECT to_regclass('public.requests') IS NOT NULL;")"
 ledger_count="$(psql_query "SELECT count(*) FROM $LEDGER;")"
 
 if [ "$has_requests" = "t" ] && [ "$ledger_count" = "0" ]; then
     log "Auto-baseline: existing database detected (public.requests present, ledger empty)."
-    log "Auto-baseline: recording 001-008 as already applied; only 009+ will run."
+    log "Auto-baseline: recording 000-008 as already applied; only 009+ will run."
     psql_query "INSERT INTO $LEDGER (filename) VALUES
+        ('000_create_timescaledb.sql'),
         ('001_schema.sql'),
         ('002_hypertables_compression_retention.sql'),
         ('003_continuous_aggregates.sql'),
@@ -115,7 +116,7 @@ if [ "$has_requests" = "t" ] && [ "$ledger_count" = "0" ]; then
         ('007_deployment_inventory.sql'),
         ('008_ttft_classification.sql')
     ON CONFLICT (filename) DO NOTHING;"
-    log "Auto-baseline: ledger seeded with 8 pre-migrator files."
+    log "Auto-baseline: ledger seeded with 9 pre-migrator files."
 else
     log "Auto-baseline: skipped (public.requests present: $has_requests, ledger rows: $ledger_count)."
 fi
