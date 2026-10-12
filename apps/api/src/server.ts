@@ -2248,7 +2248,7 @@ export function buildErrorCooldownSql(): string {
  *  ever invented (AGENTS.md ghost-filter). */
 export function buildErrorStateHealthSql(): string {
   return (
-    `SELECT h.ts, h.model_id, h.status, i.model_group, i.api_base, COALESCE(i.raw_model, '') AS raw_model ` +
+    `SELECT h.ts, h.model_id, h.status, i.model_id AS inv_model_id, i.model_group, i.api_base, COALESCE(i.raw_model, '') AS raw_model ` +
     `FROM deployment_health h ` +
     `LEFT JOIN deployment_inventory i ON i.model_id = h.model_id ` +
     `WHERE h.ts >= now() - ($1 * interval '1 second') ` +

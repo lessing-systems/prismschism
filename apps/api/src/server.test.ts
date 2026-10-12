@@ -3491,6 +3491,10 @@ describe('buildError*Sql — parameterized windows, ghost-filter, redaction-by-c
     expect(sql).toContain('ORDER BY h.model_id, h.ts ASC');
     expect(sql).not.toContain('DISTINCT ON');
     expect(sql).toContain('LEFT JOIN deployment_inventory i ON i.model_id = h.model_id');
+    // The enrichment seam: toStateErrorEpisodes gates on row.inv_model_id, so
+    // the alias MUST be selected (mirrors the cooldown SQL test above) or the
+    // resolved-deployment detail is unreachable.
+    expect(sql).toContain('i.model_id AS inv_model_id');
     expect(sql).toContain('i.api_base');
     expect(sql).toContain("COALESCE(i.raw_model, '') AS raw_model");
     expect(sql).toContain("model_id <> 'None'");
