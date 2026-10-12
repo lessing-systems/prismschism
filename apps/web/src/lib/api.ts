@@ -92,3 +92,42 @@ export function fetchSeries(metric: Metric, range: Range, group?: string): Promi
 export function fetchBreakdown(metric: Metric, range: Range): Promise<Breakdown[]> {
   return getJson<Breakdown[]>("/breakdown", { metric, range });
 }
+
+export interface InflightGauge {
+  ts: string | null;
+  value: number | null;
+  unit: string;
+}
+
+export interface InflightModelGroup {
+  modelId: string;
+  distinct: number;
+}
+
+export interface InflightBackend {
+  backend: string;
+  running: number | null;
+  waiting: number | null;
+  max: number | null;
+}
+
+export interface InflightResponse {
+  inflight: InflightGauge;
+  sessions: {
+    windowMinutes: number;
+    distinctTotal: number;
+    byModel: InflightModelGroup[];
+  };
+  backends: InflightBackend[];
+}
+
+/**
+ * Live in-flight gauge + distinct sessions seen inside `windowMinutes`
+ * (server default when omitted). The gauge degrades to `{ ts: null,
+ * value: null }` — with a 200 — while the in_flight table is missing.
+ */
+export function fetchInflight(windowMinutes?: number): Promise<InflightResponse> {
+  return getJson<InflightResponse>("/inflight", {
+    windowMinutes: windowMinutes === undefined ? undefined : String(windowMinutes),
+  });
+}

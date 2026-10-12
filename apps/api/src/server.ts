@@ -947,12 +947,16 @@ export type ActivityState = "healthy" | "prefill" | "idle";
  *  health states plus the activity `idle`. */
 export type PointState = DeploymentState | ActivityState;
 
-/** A raw `deployment_health` row as returned by pg. All three keys are optional/
- *  nullable — a malformed row (null status or missing keys) is ignored. */
+/** A raw `deployment_health` row as returned by pg. All keys are optional/
+ *  nullable — a malformed row (null status or missing keys) is ignored. `ts`
+ *  is the row's write time (pg parses timestamptz to a Date); it breaks the
+ *  latest-row-wins tie so a renamed `litellm_model_name` spelling cannot keep
+ *  a stale state alive. */
 export interface HealthRow {
   model_id: string | null;
   litellm_model_name: string | null;
   status: string | null;
+  ts?: unknown;
 }
 
 /** Severity ordering used to resolve the worst state when a group maps to
@@ -961,25 +965,49 @@ export interface HealthRow {
 const STATE_RANK: Record<PointState, number> = { idle: 0, healthy: 1, prefill: 2, error: 3 };
 
 /** Build the deployment-health query. Selects the LATEST health row per
- *  (model_id, litellm_model_name) within the look-back window, which is bound
- *  as `$1` (seconds). `model_id`/`litellm_model_name` are fixed, whitelisted
- *  column names from the documented table contract — never user input. */
+ *  `model_id` — NOT per (model_id, litellm_model_name) spelling — within the
+ *  look-back window bound as `$1` (seconds). A renamed deployment label must
+ *  not resurrect a stale state: only the newest row of the deployment survives,
+ *  whichever spelling it carries. `litellm_model_name` is still projected (the
+ *  model_id-grouped label stamping reads it) but never splits the latest-row
+ *  decision. `model_id`/`litellm_model_name` are fixed, whitelisted column
+ *  names from the documented table contract — never user input. */
 export function buildHealthSql(): string {
   return (
-    `SELECT DISTINCT ON (model_id, litellm_model_name) model_id, litellm_model_name, status ` +
+    `SELECT DISTINCT ON (model_id) model_id, litellm_model_name, status, ts ` +
     `FROM deployment_health ` +
     `WHERE ts >= now() - ($1 * interval '1 second') ` +
-    `ORDER BY model_id, litellm_model_name, ts DESC`
+    `ORDER BY model_id, ts DESC`
   );
 }
 
-/** Health rows -> a map keyed by BOTH `model_id` and `litellm_model_name` (each
- *  row contributes to both keys). The value is the group's `DeploymentState`;
- *  when several rows map to the same key the WORST state wins. Contract:
- *  `healthy`/`prefill`/`error` map directly; any OTHER non-null status -> error;
- *  a null/missing status -> the row is ignored (its keys stay absent). */
+/** pg row `ts` -> comparable epoch ms; anything unusable (null, unparseable,
+ *  non-finite) ranks as -Infinity so it can never win a latest-row contest. */
+function healthRowTsMs(ts: unknown): number {
+  if (ts instanceof Date) {
+    const ms = ts.getTime();
+    return Number.isFinite(ms) ? ms : Number.NEGATIVE_INFINITY;
+  }
+  if (typeof ts === "number") return Number.isFinite(ts) ? ts : Number.NEGATIVE_INFINITY;
+  if (typeof ts === "string") {
+    const parsed = Date.parse(ts);
+    return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+  }
+  return Number.NEGATIVE_INFINITY;
+}
+
+/** Health rows -> a map keyed by `model_id` ONLY. Each row contributes to its
+ *  `model_id` key; when several rows share a `model_id` (e.g. one state per
+ *  `litellm_model_name` spelling) the row with the LATEST `ts` wins — the
+ *  deployment state follows the newest health row, so an old error written
+ *  under a stale spelling cannot pin itself after a newer healthy row under a
+ *  renamed spelling. When `ts` is absent or ties, the WORST state wins
+ *  (STATE_RANK order). Contract: `healthy`/`prefill`/`error` map directly; any
+ *  OTHER non-null status -> error; a null/missing status -> the row is ignored
+ *  (its key stays absent). */
 export function buildStateByGroup(rows: readonly HealthRow[]): Map<string, DeploymentState> {
   const map = new Map<string, DeploymentState>();
+  const tsByGroup = new Map<string, number>();
   for (const row of rows) {
     const status = row.status;
     let state: DeploymentState;
@@ -990,11 +1018,18 @@ export function buildStateByGroup(rows: readonly HealthRow[]): Map<string, Deplo
     } else {
       state = "error"; // contract: other -> error
     }
-    for (const key of [row.model_id, row.litellm_model_name]) {
-      if (key === null || key === undefined) continue;
-      const k = String(key);
-      const prev = map.get(k);
-      if (!prev || STATE_RANK[state] > STATE_RANK[prev]) map.set(k, state);
+    const key = row.model_id;
+    if (key === null || key === undefined) continue;
+    const k = String(key);
+    const ts = healthRowTsMs(row.ts);
+    const prevTs = tsByGroup.get(k) ?? Number.NEGATIVE_INFINITY;
+    const prev = map.get(k);
+    if (
+      ts > prevTs ||
+      (ts === prevTs && (!prev || STATE_RANK[state] > STATE_RANK[prev]))
+    ) {
+      map.set(k, state);
+      tsByGroup.set(k, ts);
     }
   }
   return map;
@@ -1174,12 +1209,12 @@ export function buildLabelToModelIds(
  *  order per point (worst-wins within each authority, via STATE_RANK):
  *
  *  (a) DEPLOYMENT health: the point's `group` is a request-side label, looked up
- *  directly first (legacy: the label may already BE a `model_id` /
- *  `litellm_model_name`) and then through every `model_id` the bridge maps it to.
- *  The WORST deployment state across candidates that exist in `stateByGroup`
- *  wins (AMBIGUITY RULE: one label served by several deployments with differing
- *  states reports the worst — exactly how `buildStateByGroup` collapses several
- *  deployments onto one key).
+ *  directly first (legacy: the label may already BE a `model_id` — the state
+ *  map is keyed by `model_id` only) and then through every `model_id` the
+ *  bridge maps it to. The WORST deployment state across candidates that exist
+ *  in `stateByGroup` wins (AMBIGUITY RULE: one label served by several
+ *  deployments with differing states reports the worst — exactly how the
+ *  bridge collapses several deployments onto one label).
  *  (b) ERROR IS ABSOLUTE `deployment_health` is the error
  *  authority, so a resolved `error` is assigned and the point is done — no
  *  derived activity reading (idle/healthy/prefill) may ever mask a real error.
@@ -1713,6 +1748,293 @@ export function toBreakdown(rows: readonly BreakdownRow[]): BreakdownItem[] {
   return items;
 }
 
+// ===========================================================================
+// GET /api/inflight — the in-flight gauge + distinct active sessions
+// ===========================================================================
+
+/** /api/inflight window bounds: the look-back for the distinct-sessions
+ *  queries is `windowMinutes`, optional (default 15) and clamped to [1, 1440]
+ *  (one minute .. one day). */
+export const DEFAULT_INFLIGHT_WINDOW_MINUTES = 15;
+export const INFLIGHT_WINDOW_MIN_MINUTES = 1;
+export const INFLIGHT_WINDOW_MAX_MINUTES = 1440;
+
+/** The single row `buildInflightSql` emits: the latest `in_flight` scrape.
+ *  pg hands `ts` back as a Date (timestamptz) and `value` as text or null. */
+export interface InflightRow {
+  ts?: unknown;
+  value?: unknown;
+  unit?: unknown;
+}
+
+/** One `buildInflightSessionsByModelSql` row: a model_id group and its
+ *  distinct-identity-tuple count (aliased `distinct_count`). */
+export interface InflightSessionsRow {
+  model_id?: unknown;
+  distinct_count?: unknown;
+}
+
+/** The single row `buildInflightSessionsTotalSql` emits. */
+export interface InflightTotalRow {
+  distinct_total?: unknown;
+}
+
+/** The latest in_flight row. No parameters — always the newest scrape,
+ *  exactly the gauge reading the scraper last wrote. */
+export function buildInflightSql(): string {
+  return `SELECT ts, value, unit FROM in_flight ORDER BY ts DESC LIMIT 1`;
+}
+
+/** The distinct active identity tuples from `requests` within the window.
+ *  The window is bound as `$1` in MINUTES (unlike the seconds everywhere
+ *  else, this endpoint's contract is minutes). The row constructor
+ *  `("user", api_key_alias, team)` is count-distinct'd: Postgres compares
+ *  row values component-wise, so NULL components neither collapse distinct
+ *  identities into one nor crash the aggregate. Nothing is interpolated. */
+export function buildInflightSessionsTotalSql(): string {
+  return (
+    `SELECT COUNT(DISTINCT ("user", api_key_alias, team)) AS distinct_total FROM requests ` +
+    `WHERE ts >= now() - ($1 * interval '1 minute')`
+  );
+}
+
+/** The same distinct-identity count grouped by model_group, top 8 by count
+ *  descending — the per-model axis of the sessions card. Ghost-filter safe:
+ *  the inner JOIN on deployment_inventory drops metric-only model_ids (no
+ *  inventory row), the api_base check mirrors the real_hw backend-identity
+ *  guard, and grouping by i.model_group surfaces the front-end group rather
+ *  than raw deployment names — never "None"/"Other" buckets. The window is
+ *  bound as `$1` in MINUTES; nothing is interpolated. */
+export function buildInflightSessionsByModelSql(): string {
+  return (
+    `SELECT i.model_group AS model_id, ` +
+    `COUNT(DISTINCT (r."user", r.api_key_alias, r.team)) AS distinct_count ` +
+    `FROM requests r ` +
+    `JOIN deployment_inventory i ON i.model_id = r.model_id ` +
+    `WHERE r.ts >= now() - ($1 * interval '1 minute') ` +
+    `AND r.model_id IS NOT NULL AND r.model_id <> '' AND r.model_id <> 'None' ` +
+    `AND COALESCE(i.api_base, '') <> '' ` +
+    `GROUP BY i.model_group ` +
+    `ORDER BY distinct_count DESC, model_id ASC ` +
+    `LIMIT 8`
+  );
+}
+
+/** One pivoted `buildInflightBackendsSql` row: a backend and its latest-tick
+ *  lane gauges. Each `*_lane` column is the FILTER-pivoted metric value and is
+ *  null when the backend's latest tick carries no row for that metric. */
+export interface InflightBackendRow {
+  backend?: unknown;
+  running_lane?: unknown;
+  waiting_lane?: unknown;
+  max_lane?: unknown;
+}
+
+/** The latest tick per backend from `backend_lanes`, pivoted to one row per
+ *  backend. `latest` takes MAX(ts) per backend; joining back on (backend, ts)
+ *  and MAX(...)-FILTER-ing per metric takes each metric's value AT that tick —
+ *  a metric absent from the tick pivots to null, not 0. No parameters: like
+ *  the gauge, this is a point-in-time reading (windowMinutes does not apply).
+ *  Ordered by backend ascending so the payload is deterministic. */
+export function buildInflightBackendsSql(): string {
+  return (
+    `WITH latest AS (SELECT backend, MAX(ts) AS ts FROM backend_lanes GROUP BY backend) ` +
+    `SELECT l.backend, ` +
+    `MAX(l.value) FILTER (WHERE l.metric = 'running') AS running_lane, ` +
+    `MAX(l.value) FILTER (WHERE l.metric = 'waiting') AS waiting_lane, ` +
+    `MAX(l.value) FILTER (WHERE l.metric = 'max') AS max_lane ` +
+    `FROM backend_lanes l JOIN latest ON latest.backend = l.backend AND latest.ts = l.ts ` +
+    `GROUP BY l.backend ORDER BY l.backend ASC`
+  );
+}
+
+/** True when the error is pg's 42P01 (undefined_table) — the shape the
+ *  /api/inflight handler tolerates for the not-yet-migrated `in_flight`
+ *  table (deploy order: API before migration). */
+export function isPgUndefinedTable(err: unknown): boolean {
+  return (err as { code?: unknown } | null | undefined)?.code === "42P01";
+}
+
+/** A finished in-flight gauge — the `inflight` field of the /api/inflight
+ *  contract. A missing row (or a failed/unmigrated in_flight table) is
+ *  `{ ts: null, value: null, unit: "count" }`: the gauge is a point-in-time
+ *  reading, and "no reading" must stay null, never a fabricated 0. */
+export interface InflightGauge {
+  ts: string | null;
+  value: number | null;
+  unit: string;
+}
+
+/** One row (or none) -> the gauge field. `ts` is ISO-8601 or null; a null
+ *  storage value stays null; a non-numeric value is treated as no reading. */
+export function toInflight(row: InflightRow | null | undefined): InflightGauge {
+  if (row === null || row === undefined) {
+    return { ts: null, value: null, unit: "count" };
+  }
+  let ts: string | null = null;
+  if (row.ts !== null && row.ts !== undefined) {
+    const ms = row.ts instanceof Date ? row.ts.getTime() : Date.parse(String(row.ts));
+    if (Number.isFinite(ms)) ts = new Date(ms).toISOString();
+  }
+  let value: number | null = null;
+  if (row.value !== null && row.value !== undefined) {
+    const n = Number(row.value);
+    if (Number.isFinite(n)) value = n;
+  }
+  const unit = row.unit === null || row.unit === undefined ? "count" : String(row.unit);
+  return { ts, value, unit };
+}
+
+/** A finished byModel entry — matches the contract's byModel items exactly. */
+export interface InflightModelGroup {
+  modelId: string;
+  distinct: number;
+}
+
+/** A finished backends entry — the `backends` items of the /api/inflight
+ *  contract: per-backend latest-tick lane gauges, each null when the backend's
+ *  latest tick has no row for that metric (never fabricated to 0). */
+export interface InflightBackend {
+  backend: string;
+  running: number | null;
+  waiting: number | null;
+  max: number | null;
+}
+
+/** Pivoted backend_lanes rows -> `[{ backend, running, waiting, max }]`. A
+ *  null/undefined or non-numeric metric degrades to null ("no reading" stays
+ *  null, never a fabricated 0, matching the gauge precedent). Re-sorted by
+ *  backend ascending so the payload is deterministic even though the SQL
+ *  already orders it. */
+export function toInflightBackends(rows: readonly InflightBackendRow[]): InflightBackend[] {
+  const lane = (v: unknown): number | null => {
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  return rows
+    .map((row) => ({
+      backend: row.backend === null || row.backend === undefined ? "" : String(row.backend),
+      running: lane(row.running_lane),
+      waiting: lane(row.waiting_lane),
+      max: lane(row.max_lane),
+    }))
+    .sort((a, b) => (a.backend < b.backend ? -1 : a.backend > b.backend ? 1 : 0));
+}
+
+/** Sessions byModel rows -> `[{ modelId, distinct }]`. A null model_id group
+ *  becomes "(unknown)" (the convention the breakdown handler already uses);
+ *  a non-numeric count degrades to 0. Sorted by distinct descending with ties
+ *  broken by modelId ascending, so the payload is deterministic even though
+ *  the SQL already orders it. */
+export function toInflightModelGroups(rows: readonly InflightSessionsRow[]): InflightModelGroup[] {
+  const groups = rows.map((row) => {
+    const raw = row.model_id;
+    const modelId = raw === null || raw === undefined ? "(unknown)" : String(raw);
+    const n = Number(row.distinct_count);
+    return { modelId, distinct: Number.isFinite(n) ? n : 0 };
+  });
+  groups.sort((a, b) => {
+    if (b.distinct !== a.distinct) return b.distinct - a.distinct;
+    return a.modelId < b.modelId ? -1 : a.modelId > b.modelId ? 1 : 0;
+  });
+  return groups;
+}
+
+/** GET /api/inflight?windowMinutes=15 -> the in-flight gauge plus the
+ *  distinct active identity tuples within the window.
+ *
+ *  Robustness for deploy order: if the in_flight query fails with pg's 42P01
+ *  (undefined_table — migration 009 not applied yet), the gauge degrades to
+ *  `{ ts: null, value: null }` and the response is still 200; if the
+ *  backend_lanes query fails with 42P01 (migration 010 not applied yet),
+ *  `backends` degrades to `[]` the same way, and if the byModel sessions
+ *  query fails with 42P01 (deployment_inventory not yet backfilled), `byModel`
+ *  degrades to `[]` too. Any OTHER query failure is a 500, as in
+ *  every other handler here. */
+function handleInflight(query: QueryFn, params: URLSearchParams, res: ServerResponse): void {
+  const raw = params.get("windowMinutes");
+  let windowMinutes = DEFAULT_INFLIGHT_WINDOW_MINUTES;
+  if (raw !== null && raw.trim() !== "") {
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+      sendJson(res, 400, { error: "invalid windowMinutes" });
+      return;
+    }
+    windowMinutes = Math.min(
+      INFLIGHT_WINDOW_MAX_MINUTES,
+      Math.max(INFLIGHT_WINDOW_MIN_MINUTES, Math.floor(parsed))
+    );
+  }
+
+  // The gauge query: 42P01 (migration not yet applied) degrades to a null
+  // gauge, exactly the failure-tolerance shape /api/kpis uses per field.
+  const inflightRow: Promise<InflightRow | null> = query(buildInflightSql(), [])
+    .then((result) => (result.rows[0] ?? null) as InflightRow | null)
+    .catch((err: unknown) => {
+      if (isPgUndefinedTable(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn("in_flight table missing (migration 009 not applied); emitting null inflight:", message);
+        return null;
+      }
+      throw err;
+    });
+
+  const totalRow: Promise<InflightTotalRow | undefined> = query(
+    buildInflightSessionsTotalSql(),
+    [windowMinutes]
+  ).then((result) => result.rows[0] as InflightTotalRow | undefined);
+
+  // The byModel sessions query: 42P01 (deployment_inventory missing/not yet
+  // backfilled) degrades to an empty array, the same tolerance shape as the
+  // in_flight gauge and backend_lanes above.
+  const byModelRows: Promise<InflightSessionsRow[]> = query(
+    buildInflightSessionsByModelSql(),
+    [windowMinutes]
+  )
+    .then((result) => result.rows as InflightSessionsRow[])
+    .catch((err: unknown) => {
+      if (isPgUndefinedTable(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn("deployment_inventory missing (migration not applied); emitting empty byModel:", message);
+        return [];
+      }
+      throw err;
+    });
+
+  // The backends-lane query: 42P01 (migration 010 not yet applied) degrades
+  // to an empty array, the same tolerance shape as the in_flight gauge above.
+  const backendRows: Promise<InflightBackendRow[]> = query(buildInflightBackendsSql(), [])
+    .then((result) => result.rows as InflightBackendRow[])
+    .catch((err: unknown) => {
+      if (isPgUndefinedTable(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn("backend_lanes table missing (migration 010 not applied); emitting empty backends:", message);
+        return [];
+      }
+      throw err;
+    });
+
+  Promise.all([inflightRow, totalRow, byModelRows, backendRows])
+    .then(([row, total, groups, backends]) => {
+      const n = Number(total?.distinct_total);
+      sendJson(res, 200, {
+        inflight: toInflight(row),
+        sessions: {
+          windowMinutes,
+          distinctTotal: Number.isFinite(n) ? n : 0,
+          byModel: toInflightModelGroups(groups),
+        },
+        backends: toInflightBackends(backends),
+      });
+    })
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("inflight query failed:", message);
+      sendJson(res, 500, { error: "internal error" });
+    });
+}
+
 /** GET /api/kpis?range= -> the six contract fields, ALL keys always present.
  *
  *  `error_rate` and `p95_ms` have NO data source in this database (verified
@@ -1838,8 +2160,8 @@ function handleBreakdown(query: QueryFn, params: URLSearchParams, res: ServerRes
 }
 
 /** Build the single `node:http` request handler. `createServer(handler)` yields
- *  a ready server. GET /api/series, /api/kpis and /api/breakdown are
- *  implemented; every other request is a 404. */
+ *  a ready server. GET /api/series, /api/kpis, /api/breakdown and
+ *  /api/inflight are implemented; every other request is a 404. */
 export function createRequestHandler(deps: HandlerDeps): (req: IncomingMessage, res: ServerResponse) => void {
   const { query } = deps;
 
@@ -1860,6 +2182,10 @@ export function createRequestHandler(deps: HandlerDeps): (req: IncomingMessage, 
     }
     if (url.pathname === "/api/breakdown") {
       handleBreakdown(query, url.searchParams, res);
+      return;
+    }
+    if (url.pathname === "/api/inflight") {
+      handleInflight(query, url.searchParams, res);
       return;
     }
     if (url.pathname !== "/api/series") {
@@ -2011,8 +2337,8 @@ export function createRequestHandler(deps: HandlerDeps): (req: IncomingMessage, 
         const stateByGroup = buildStateByGroup(health.rows as HealthRow[]);
         // Request-side labels never appear in deployment_health, so resolve
         // state through the model_id bridge (direct label lookup still wins
-        // when the label already is a model_id / litellm_model_name). The
-        // per-bucket activity state (derived once from the out/req/ttft
+        // when the label already is a model_id — the state map is keyed by
+        // model_id only). The per-bucket activity state (derived once from the out/req/ttft
         // increments) takes precedence over a NON-error deployment state
         //
         // but can never override an error — error is absolute.

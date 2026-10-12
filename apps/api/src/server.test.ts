@@ -28,6 +28,7 @@ import {
   buildBridgeSql,
   buildDerivedSql,
   buildHealthSql,
+  buildInflightSessionsByModelSql,
   buildKpiTotalRawSql,
   buildKpiTotalSql,
   buildLabelToModelIds,
@@ -52,6 +53,7 @@ import {
   RANGE_SECONDS,
   TIER_MAP,
   toBreakdown,
+  toInflightModelGroups,
   toPoints,
   tierForRange,
   TTFT_CLASSIFIER_AXES,
@@ -438,23 +440,28 @@ describe('exported reference constants', () => {
 
 describe('deployment health state', () => {
   describe('buildHealthSql — SQL construction', () => {
-    it('selects the latest health row per (model_id, litellm_model_name) in the look-back window', () => {
+    it('selects the latest health row per model_id in the look-back window (spelling-independent)', () => {
       const sql = buildHealthSql();
       expect(sql).toContain('FROM deployment_health');
-      expect(sql).toContain('DISTINCT ON (model_id, litellm_model_name)');
+      expect(sql).toContain('DISTINCT ON (model_id)');
       expect(sql).toContain("ts >= now() - ($1 * interval '1 second')");
-      expect(sql).toContain('ORDER BY model_id, litellm_model_name, ts DESC');
+      expect(sql).toContain('ORDER BY model_id, ts DESC');
+      // litellm_model_name is still projected (label stamping reads it) but
+      // must never split the latest-row decision.
+      expect(sql).toContain('litellm_model_name');
+      expect(sql).not.toContain('DISTINCT ON (model_id, litellm_model_name)');
+      expect(sql).not.toContain('ORDER BY model_id, litellm_model_name');
     });
   });
 
   describe('buildStateByGroup — health rows → group state map', () => {
-    it('maps a row to both model_id and litellm_model_name keys', () => {
+    it('keys the map by model_id only (litellm_model_name is no longer a state key)', () => {
       const rows = [
         { model_id: 'gpt-4', litellm_model_name: 'gpt-4-prod', status: 'error' },
       ];
       const map = buildStateByGroup(rows);
       expect(map.get('gpt-4')).toBe('error');
-      expect(map.get('gpt-4-prod')).toBe('error');
+      expect(map.get('gpt-4-prod')).toBeUndefined();
     });
 
     it('maps unknown/other status values to "error"', () => {
@@ -463,7 +470,6 @@ describe('deployment health state', () => {
       ];
       const map = buildStateByGroup(rows);
       expect(map.get('gpt-4')).toBe('error');
-      expect(map.get('gpt-4-prod')).toBe('error');
     });
 
     it('ignores rows whose status is null (the key is absent)', () => {
@@ -472,10 +478,28 @@ describe('deployment health state', () => {
       ];
       const map = buildStateByGroup(rows);
       expect(map.get('gpt-4')).toBeUndefined();
-      expect(map.get('gpt-4-prod')).toBeUndefined();
     });
 
-    it('keeps the worst state when a group appears with several states', () => {
+    it('follows the LATEST row per model_id: a newer healthy row under a renamed spelling heals an older error', () => {
+      // glm53 regression pin: the Oct 11 outage wrote error rows under one
+      // litellm_model_name spelling; healthy rows now arrive under another.
+      // The state must follow the newest row, not the worst across spellings.
+      const rows = [
+        { model_id: 'glm-5.3', litellm_model_name: 'deploy-old-spelling', status: 'error', ts: '2026-10-11T00:00:00.000Z' },
+        { model_id: 'glm-5.3', litellm_model_name: 'deploy-new-spelling', status: 'healthy', ts: '2026-10-12T00:00:00.000Z' },
+      ];
+      expect(buildStateByGroup(rows).get('glm-5.3')).toBe('healthy');
+    });
+
+    it('follows the LATEST row per model_id: a newer error beats an older healthy row', () => {
+      const rows = [
+        { model_id: 'glm-5.3', litellm_model_name: 'deploy-old-spelling', status: 'healthy', ts: '2026-10-11T00:00:00.000Z' },
+        { model_id: 'glm-5.3', litellm_model_name: 'deploy-new-spelling', status: 'error', ts: '2026-10-12T00:00:00.000Z' },
+      ];
+      expect(buildStateByGroup(rows).get('glm-5.3')).toBe('error');
+    });
+
+    it('ties (or absent ts) fall back to worst-wins per model_id', () => {
       const base = [
         { model_id: 'm1', litellm_model_name: 'a', status: 'healthy' },
         { model_id: 'm1', litellm_model_name: 'b', status: 'prefill' },
@@ -800,7 +824,9 @@ describe('attachStates — request label → deployment state via the bridge map
       { model_id: 'mid-1', litellm_model_name: 'deploy-a', status: 'error' },
     ]);
     const labelToModelIds = new Map<string, string[]>();
-    const points: SeriesPoint[] = [{ t: '2026-09-29T10:00:00.000Z', group: 'deploy-a', value: 10 }];
+    // The state map is keyed by model_id only, so the direct fallback resolves
+    // when the label already IS the model_id.
+    const points: SeriesPoint[] = [{ t: '2026-09-29T10:00:00.000Z', group: 'mid-1', value: 10 }];
 
     const out = attachStates(points, stateByGroup, labelToModelIds);
 
@@ -865,7 +891,7 @@ describe('attachStates — request label → deployment state via the bridge map
     const labelToModelIds = new Map<string, string[]>([['req-label', ['mid-1']]]);
     const points: SeriesPoint[] = [
       { t: '2026-09-29T10:00:00.000Z', group: 'req-label', value: 10 },
-      { t: '2026-09-29T10:05:00.000Z', group: 'deploy-a', value: 20 },
+      { t: '2026-09-29T10:05:00.000Z', group: 'mid-1', value: 20 },
     ];
 
     const out = attachStates(points, stateByGroup, labelToModelIds);
@@ -1626,6 +1652,55 @@ describe('buildActivitySql — activity state machine SQL', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Source guard — instance_health.status (raw scrape-error text) never leaves
+// the DB
+// ---------------------------------------------------------------------------
+
+// The scraper stores raw fetch-error text in instance_health.status
+// ("fetch http://<host>:<port>: context deadline exceeded"). The host/IP in
+// that string is an identity vector, so the API must NEVER select or serialize
+// it: the only instance_health query in server.ts is the fleet-wide
+// scrape-health probe, which reads max(ts) aggregates only. This guard fails
+// if any SQL in server.ts ever starts selecting `status` (or a bare `up`)
+// from instance_health — raw error text would then flow to API responses.
+
+describe('server.ts source guard — instance_health.status never leaves the DB', () => {
+  const src = readFileSync(new URL('./server.ts', import.meta.url), 'utf8');
+
+  /** Every backtick SQL literal in server.ts that touches instance_health. */
+  const instanceHealthSqls = (src.match(/`[^`]*FROM instance_health[^`]*`/g) ?? []).map((s) =>
+    s.toLowerCase(),
+  );
+
+  it('contains an instance_health query (positive control: the probe exists)', () => {
+    expect(instanceHealthSqls.length).toBeGreaterThan(0);
+  });
+
+  it('no instance_health SQL selects the raw status column', () => {
+    for (const sql of instanceHealthSqls) {
+      expect(sql, `instance_health SQL selects status: ${sql}`).not.toMatch(/\bstatus\b/);
+    }
+  });
+
+  it('no instance_health SQL selects a bare up column (only up aggregates in FILTER)', () => {
+    for (const sql of instanceHealthSqls) {
+      // `up` may appear only inside `FILTER (WHERE up ...)` / `(WHERE NOT up)`,
+      // never as a selected column (e.g. ", up" or "up AS").
+      expect(sql, `instance_health SQL selects up: ${sql}`).not.toMatch(/select\b[^`]*\bup\b(?![^`]*\bfilter\b)/);
+    }
+  });
+
+  it('the scrape-health probe exposes timestamps only, so no host/IP can reach a response', () => {
+    // The probe's select list is max(ts) aggregates — no text columns at all.
+    // (The SQL is split across concatenated fragments, so assert on the source.)
+    expect(src).toMatch(
+      /SELECT max\(ts\) FILTER \(WHERE up\) AS last_up_ts, max\(ts\) AS last_seen_ts/,
+    );
+    expect(instanceHealthSqls.join('\n')).not.toMatch(/https?:\/\//);
+  });
+});
+
 describe('server.ts source guard — activity metric literals match the scraper SSOT', () => {
   const src = readFileSync(new URL('./server.ts', import.meta.url), 'utf8');
 
@@ -1983,7 +2058,7 @@ describe('GET /api/series — activity state machine integration', () => {
     const q = makeDispatchingQuery(
       [{ bucket, model: 'gpt-4', value: '10' }],
       [{ model_id: 'mid-1', litellm_model_name: 'gpt-4', status: 'error' }],
-      [{ model: 'gpt-4', model_id: 'mid-1' }],
+      [{ label: 'gpt-4', model_id: 'mid-1' }],
       [{ bucket, grp: 'gpt-4', out_inc: 0, req_inc: 0, ttft_inc: 0 }],
     );
     const srv = await startServer(q);
@@ -2031,7 +2106,7 @@ describe('GET /api/series — activity state machine integration', () => {
     const q = makeDispatchingQuery(
       [{ bucket, model: 'gpt-4', value: '10' }],
       [{ model_id: 'mid-1', litellm_model_name: 'gpt-4', status: 'error' }],
-      [{ model: 'gpt-4', model_id: 'mid-1' }],
+      [{ label: 'gpt-4', model_id: 'mid-1' }],
       [],
     );
     const srv = await startServer(q);
@@ -2105,7 +2180,7 @@ describe('GET /api/series — activity state machine integration', () => {
     const q = makeDispatchingQuery(
       [{ bucket, model: 'gpt-4', value: '10' }],
       [{ model_id: 'mid-1', litellm_model_name: 'gpt-4', status: 'healthy' }],
-      [{ model: 'gpt-4', model_id: 'mid-1' }],
+      [{ label: 'gpt-4', model_id: 'mid-1' }],
       [{ bucket, grp: 'gpt-4', out_inc: 0, req_inc: 0, ttft_inc: 0 }],
     );
     const srv = await startServer(q);
@@ -2772,5 +2847,289 @@ describe('server.ts source guard — kpis/breakdown surface', () => {
 
   it('emits p95_ms as a literal null (no DB backing, never fabricated)', () => {
     expect(src).toContain('p95_ms: null');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/inflight — integration (in-flight gauge + distinct sessions)
+// ---------------------------------------------------------------------------
+
+/** GET `${base}/api/inflight?${qs}` and return status + parsed JSON body. */
+async function getInflight(base: string, qs: string): Promise<{ status: number; body: any }> {
+  const res = await fetch(`${base}/api/inflight?${qs}`);
+  const body = await res.json();
+  return { status: res.status, body };
+}
+
+/**
+ * A `vi.fn()` fake `QueryFn` for /api/inflight, which issues FOUR queries
+ * (the latest `in_flight` row, the distinct-total row, the per-model
+ * groups, and the per-backend lane pivot). It dispatches on the SQL text so
+ * each query can be canned independently; `fail` names one query that rejects
+ * with a pg-style error carrying `code` (42P01 = undefined_table) to pin the
+ * missing-table tolerance.
+ */
+function makeInflightQuery(spec: {
+  inflight?: any[];
+  total?: any[];
+  byModel?: any[];
+  lanes?: any[];
+  fail?: 'inflight' | 'total' | 'byModel' | 'lanes';
+  code?: string;
+}): FakeQuery {
+  return vi.fn(async (sql: string) => {
+    const which: 'inflight' | 'total' | 'byModel' | 'lanes' = sql.includes('FROM in_flight')
+      ? 'inflight'
+      : sql.includes('FROM backend_lanes')
+        ? 'lanes'
+        : sql.includes('distinct_count')
+          ? 'byModel'
+          : 'total';
+    if (spec.fail === which) {
+      const err = new Error(`injected failure: ${which}`);
+      if (spec.code) (err as any).code = spec.code;
+      throw err;
+    }
+    return { rows: (spec[which] ?? []) as any[] };
+  }) as unknown as FakeQuery;
+}
+
+describe('GET /api/inflight — integration', () => {
+  it('serves the contract shape and binds the default 15-minute window', async () => {
+    const q = makeInflightQuery({
+      inflight: [{ ts: '2026-10-11T00:00:00.000Z', value: '7', unit: 'count' }],
+      total: [{ distinct_total: '3' }],
+      byModel: [
+        { model_id: 'gpt-4', distinct_count: '2' },
+        { model_id: 'llama', distinct_count: '1' },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, '');
+      expect(status).toBe(200);
+      expect(body).toEqual({
+        inflight: { ts: '2026-10-11T00:00:00.000Z', value: 7, unit: 'count' },
+        sessions: {
+          windowMinutes: 15,
+          distinctTotal: 3,
+          byModel: [
+            { modelId: 'gpt-4', distinct: 2 },
+            { modelId: 'llama', distinct: 1 },
+          ],
+        },
+        backends: [],
+      });
+      expect(q).toHaveBeenCalledTimes(4);
+      // The gauge and lanes queries bind nothing; the two session queries bind
+      // the window in MINUTES and count-distinct the identity row constructor.
+      const sqls = q.mock.calls.map((c) => String(c[0]));
+      expect(sqls.filter((s) => s.includes('FROM in_flight'))).toHaveLength(1);
+      expect(sqls.filter((s) => s.includes('FROM backend_lanes'))).toHaveLength(1);
+      expect(sqls.filter((s) => s.includes('COUNT(DISTINCT ('))).toHaveLength(2);
+      for (const call of q.mock.calls) {
+        if (String(call[0]).includes('FROM in_flight') || String(call[0]).includes('FROM backend_lanes')) {
+          expect(call[1]).toEqual([]);
+        } else expect(call[1]).toEqual([15]);
+      }
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('tolerates a missing in_flight table (42P01): 200 with null inflight and live sessions', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeInflightQuery({
+      fail: 'inflight',
+      code: '42P01',
+      total: [{ distinct_total: '5' }],
+      byModel: [{ model_id: 'gpt-4', distinct_count: '5' }],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, 'windowMinutes=60');
+      expect(status).toBe(200);
+      expect(body.inflight).toEqual({ ts: null, value: null, unit: 'count' });
+      expect(body.sessions).toEqual({
+        windowMinutes: 60,
+        distinctTotal: 5,
+        byModel: [{ modelId: 'gpt-4', distinct: 5 }],
+      });
+      expect(body.backends).toEqual([]);
+      expect(q).toHaveBeenCalledTimes(4);
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('in_flight table missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await srv.close();
+    }
+  });
+
+  it('clamps windowMinutes into [1, 1440] and 400s a non-numeric value without querying', async () => {
+    const q = makeInflightQuery({ inflight: [], total: [{ distinct_total: '0' }], byModel: [] });
+    const srv = await startServer(q);
+    try {
+      const bad = await getInflight(srv.base, 'windowMinutes=abc');
+      expect(bad.status).toBe(400);
+      expect(typeof bad.body.error).toBe('string');
+      expect(q).not.toHaveBeenCalled();
+
+      for (const [raw, bound] of [
+        ['0', 1],
+        ['-5', 1],
+        ['99999', 1440],
+        ['30', 30],
+      ] as const) {
+        (q as any).mockClear();
+        const { status, body } = await getInflight(srv.base, `windowMinutes=${raw}`);
+        expect(status).toBe(200);
+        expect(body.sessions.windowMinutes).toBe(bound);
+        for (const call of q.mock.calls) {
+          const sql = String(call[0]);
+          if (!sql.includes('FROM in_flight') && !sql.includes('FROM backend_lanes')) {
+            expect(call[1]).toEqual([bound]);
+          }
+        }
+      }
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('emits a null gauge (not a fabricated 0) when in_flight has no row yet', async () => {
+    const q = makeInflightQuery({ inflight: [], total: [{ distinct_total: '1' }], byModel: [] });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.inflight).toEqual({ ts: null, value: null, unit: 'count' });
+      expect(body.sessions.distinctTotal).toBe(1);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('serves per-backend lane gauges from the latest tick, nulling missing metrics, ordered by backend', async () => {
+    const q = makeInflightQuery({
+      inflight: [{ ts: '2026-10-11T00:00:00.000Z', value: '2', unit: 'count' }],
+      total: [{ distinct_total: '1' }],
+      byModel: [],
+      lanes: [
+        // The pivot row for 'alpha': waiting has no row at its latest tick.
+        { backend: 'alpha', running_lane: '3', waiting_lane: null, max_lane: '10' },
+        // 'beta': numeric strings (pg hands DOUBLE PRECISION back as text via
+        // some drivers) and a non-numeric max degrade per the mapper rules.
+        { backend: 'beta', running_lane: '0', waiting_lane: '4', max_lane: 'not-a-number' },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, '');
+      expect(status).toBe(200);
+      expect(body.backends).toEqual([
+        { backend: 'alpha', running: 3, waiting: null, max: 10 },
+        { backend: 'beta', running: 0, waiting: 4, max: null },
+      ]);
+      // The lanes query is point-in-time: it binds nothing (no windowMinutes).
+      const lanesCalls = q.mock.calls.filter((c) => String(c[0]).includes('FROM backend_lanes'));
+      expect(lanesCalls).toHaveLength(1);
+      expect(lanesCalls[0][1]).toEqual([]);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('tolerates a missing backend_lanes table (42P01): 200 with empty backends and the rest intact', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeInflightQuery({
+      inflight: [{ ts: '2026-10-11T00:00:00.000Z', value: '2', unit: 'count' }],
+      total: [{ distinct_total: '2' }],
+      byModel: [{ model_id: 'gpt-4', distinct_count: '2' }],
+      fail: 'lanes',
+      code: '42P01',
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, 'windowMinutes=30');
+      expect(status).toBe(200);
+      expect(body.backends).toEqual([]);
+      expect(body.inflight).toEqual({ ts: '2026-10-11T00:00:00.000Z', value: 2, unit: 'count' });
+      expect(body.sessions).toEqual({
+        windowMinutes: 30,
+        distinctTotal: 2,
+        byModel: [{ modelId: 'gpt-4', distinct: 2 }],
+      });
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('backend_lanes table missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await srv.close();
+    }
+  });
+
+  it('tolerates a missing deployment_inventory in byModel (42P01): 200 with empty byModel and the rest intact', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const q = makeInflightQuery({
+      inflight: [{ ts: '2026-10-11T00:00:00.000Z', value: '4', unit: 'count' }],
+      total: [{ distinct_total: '2' }],
+      fail: 'byModel',
+      code: '42P01',
+      lanes: [
+        { backend: 'alpha', running_lane: '1', waiting_lane: null, max_lane: '2' },
+      ],
+    });
+    const srv = await startServer(q);
+    try {
+      const { status, body } = await getInflight(srv.base, 'windowMinutes=45');
+      expect(status).toBe(200);
+      expect(body.sessions).toEqual({ windowMinutes: 45, distinctTotal: 2, byModel: [] });
+      expect(body.inflight).toEqual({ ts: '2026-10-11T00:00:00.000Z', value: 4, unit: 'count' });
+      expect(body.backends).toEqual([{ backend: 'alpha', running: 1, waiting: null, max: 2 }]);
+      expect(q).toHaveBeenCalledTimes(4);
+      const messages = warnSpy.mock.calls.map((c) => String(c[0]));
+      expect(messages.some((m) => m.includes('deployment_inventory missing'))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await srv.close();
+    }
+  });
+});
+
+describe('buildInflightSessionsByModelSql — ghost-filter safe SQL (deployment_inventory join)', () => {
+  it('joins deployment_inventory, groups by the front-end model_group, and binds the window in minutes', () => {
+    const sql = buildInflightSessionsByModelSql();
+    // Inner JOIN drops metric-only ghosts (no inventory row); model_group is
+    // the front-end group (007 migration), not the raw deployment name.
+    expect(sql).toContain('FROM requests r');
+    expect(sql).toContain('JOIN deployment_inventory i ON i.model_id = r.model_id');
+    expect(sql).toContain('GROUP BY i.model_group');
+    // api_base check mirrors the real_hw backend-identity guard.
+    expect(sql).toContain("COALESCE(i.api_base, '') <> ''");
+    // Explicit exclusions: never bucket NULL/''/'None' model_ids.
+    expect(sql).toContain('r.model_id IS NOT NULL');
+    expect(sql).toContain("r.model_id <> ''");
+    expect(sql).toContain("r.model_id <> 'None'");
+    // The window is parameterized in MINUTES; the alias keeps the row contract.
+    expect(sql).toContain("now() - ($1 * interval '1 minute')");
+    expect(sql).toContain('AS model_id');
+    expect(sql).toContain('AS distinct_count');
+  });
+});
+
+describe('toInflightModelGroups — byModel rows → contract items', () => {
+  it('maps inventory-group rows to { modelId, distinct } with numeric coercion and deterministic ordering', () => {
+    expect(
+      toInflightModelGroups([
+        { model_id: 'group-b', distinct_count: '3' },
+        { model_id: 'group-a', distinct_count: '2' },
+        { model_id: 'group-a', distinct_count: '9' },
+        { model_id: 'group-c', distinct_count: 'not-a-number' },
+      ])
+    ).toEqual([
+      { modelId: 'group-a', distinct: 9 },
+      { modelId: 'group-b', distinct: 3 },
+      { modelId: 'group-a', distinct: 2 },
+      { modelId: 'group-c', distinct: 0 },
+    ]);
   });
 });

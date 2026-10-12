@@ -4,3 +4,9 @@ backends:
   - name: primary
     url: http://litellm.example.com:4000/metrics/
     key_env: LITELLM_MASTER_KEY
+  # Tensorfold inference server (exposes the tensorfold:* lane gauges the
+  # backend_lanes family stores). Placeholders only — edit both `url` and
+  # `key_env` for your deployment; each key_env variable must be set in .env.
+  - name: tensorfold
+    url: http://tensorfold.example.com:8888/metrics
+    key_env: TENSORFOLD_API_KEY

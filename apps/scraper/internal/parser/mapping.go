@@ -35,14 +35,18 @@ const (
 	FamilyCachedTokens    = "cached_tokens"
 	FamilyTotalTokens     = "total_tokens"
 	FamilyRequests        = "requests"
+	// FamilyBackendLanes is the "backend_lanes" storage family: per-backend
+	// tensorfold lane gauges (running / waiting / streams / max), keyed by the
+	// Row.Backend + Row.Metric pair.
+	FamilyBackendLanes = "backend_lanes"
 )
 
 // Row is one raw-tier record produced from a single scraped metric series.
 //
 // Family is one of the five token families (input_tokens, output_tokens,
 // reasoning_tokens, cached_tokens, total_tokens) or one of "latency",
-// "requests", "spend", "limits", "deployment_health", "counters" (see
-// metricFamily). It is the storage-side grouping key the raw table is
+// "requests", "spend", "limits", "deployment_health", "counters", "in_flight"
+// (see metricFamily). It is the storage-side grouping key the raw table is
 // partitioned by.
 //
 // MetricName is the exact Prometheus metric name (for histograms, the base
@@ -77,7 +81,13 @@ type Row struct {
 	StatusCode string
 	// Status is the normalised deployment health status string
 	// ("healthy" / "error"). Populated ONLY for the deployment_health family.
-	Status       string
+	Status string
+	// Backend is the backend identity of a tensorfold lane-gauge series.
+	// Populated ONLY for the backend_lanes family (from the series' "backend"
+	// label; the source gauges are unlabeled, so it defaults to "" — stored as
+	// the backend_lanes table's empty-string backend per its NOT NULL DEFAULT
+	// ''). Every other family leaves it "" so their output is unchanged.
+	Backend      string
 	APIProvider  string
 	Value        float64
 	Unit         string
@@ -254,6 +264,33 @@ var metricFamily = map[string]string{
 	// Generic low-cardinality event counters, differentiated by the
 	// exception_status label. Not health state.
 	"litellm_deployment_cooled_down_total": "counters",
+
+	// -- in_flight (1) --
+	// litellm_in_flight_requests is a Prometheus GAUGE — the number of HTTP
+	// requests currently in flight on the LiteLLM worker. It is UNLABELED at
+	// the source (no model_id / alias): the gauge is global to the process.
+	// As a gauge it keeps its raw value through the delta path (internal/delta
+	// treats IsCounter=false rows as pass-through), so no rate derivation
+	// happens. buildRow's default label population handles the missing
+	// labels per the existing convention: ModelID resolves to "" (stored as
+	// the family's empty-string model_id, same as every other family that
+	// lacks a model_id label — no NULL special-casing is added).
+	"litellm_in_flight_requests": "in_flight",
+
+	// ── backend_lanes (4 tensorfold lane gauges) ────────────────
+	// Per-backend tensorfold lane metrics. ALL GAUGES: IsCounter=false on
+	// every row, so the delta path (internal/delta) passes the raw reading
+	// through untouched — no rate derivation. The metric names contain ':'
+	// (valid per the Prometheus text-format name grammar
+	// [a-zA-Z_:][a-zA-Z0-9_:]*, natively accepted by expfmt.TextParser and
+	// verified against the live tensorfold endpoint) and match here by exact
+	// name. buildRow maps each name to a short lane "metric" value
+	// ("running"/"waiting"/"max"/"streams_"+state) for the backend_lanes
+	// table's metric column.
+	"tensorfold:requests_running":   FamilyBackendLanes,
+	"tensorfold:requests_waiting":   FamilyBackendLanes,
+	"tensorfold_health:streams":     FamilyBackendLanes,
+	"tensorfold_health:streams_max": FamilyBackendLanes,
 }
 
 // familyFor classifies a Prometheus metric name into a storage family.
@@ -289,6 +326,13 @@ func defaultUnit(family string) string {
 		return "usd"
 	case "limits":
 		return "ratio"
+	case "in_flight":
+		// Unlabeled gauge of concurrent in-flight HTTP requests; unitless
+		// request count, matching the requests family's unit.
+		return "count"
+	case FamilyBackendLanes:
+		// Tensorfold lane gauges: unitless lane occupancy counts.
+		return "lanes"
 	}
 	return ""
 }
@@ -410,6 +454,28 @@ func buildRow(labels []*dto.LabelPair, ts time.Time, family string, name string,
 		r.StatusCode = labelValue(labels, "status_code")
 		r.Route = labelValue(labels, "route")
 		r.ExceptionClass = labelValue(labels, "exception_class")
+	case FamilyBackendLanes:
+		// backend_lanes: the "metric" column is a SHORT lane name derived from
+		// the metric name and the `state` label, mirroring how the latency
+		// family's metric column flows from a Row field (Row.MetricName → the
+		// store's latencyValues "metric" slot). MetricName is overridden ONLY
+		// here — every other family keeps the exact Prometheus name. The
+		// `state` label remains in SeriesLabels, so sibling lane series
+		// (decoding/filling/paused) never collide on the delta tracker.
+		switch name {
+		case "tensorfold:requests_running":
+			r.MetricName = "running"
+		case "tensorfold:requests_waiting":
+			r.MetricName = "waiting"
+		case "tensorfold_health:streams":
+			r.MetricName = "streams_" + labelValue(labels, "state")
+		case "tensorfold_health:streams_max":
+			r.MetricName = "max"
+		}
+		// Backend identity: read from the series' "backend" label when the
+		// source carries one; the live tensorfold gauges are unlabeled, so it
+		// resolves to "" (the backend_lanes table's NOT NULL DEFAULT '').
+		r.Backend = labelValue(labels, "backend")
 	}
 	return r
 }
@@ -417,13 +483,17 @@ func buildRow(labels []*dto.LabelPair, ts time.Time, family string, name string,
 // valueToStatus normalises the litellm_deployment_state gauge value into the
 // closed status vocabulary stored in deployment_health.status.
 //
-// Caller decision: 0 -> "healthy"; every non-zero value (1 = partial outage,
-// 2 = under maintenance) collapses to "error". The dashboard only
-// distinguishes healthy from not-healthy, so "prefill", "partial" and "down"
-// are NEVER emitted by the scraper.
+// Caller decision: 0 -> "healthy"; 1 (partial outage) -> "prefill" — a partial
+// outage still serves traffic, and the API's closed state set (STATE_RANK in
+// apps/api/src/server.ts) has no "disabled" state, so maintenance (2) also maps
+// to "prefill" rather than the false-red "error". Any other value -> "error".
+// "error" is reserved for states the scraper cannot interpret.
 func valueToStatus(v float64) string {
 	if v == 0 {
 		return "healthy"
+	}
+	if v == 1 || v == 2 {
+		return "prefill"
 	}
 	return "error"
 }

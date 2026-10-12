@@ -56,6 +56,13 @@ func TestLatencyColumnsCarryMetric(t *testing.T) {
 			}
 		})
 	}
+	t.Run("in_flight columns are exactly ts, model_id, value, unit", func(t *testing.T) {
+		want := []string{"ts", "model_id", "value", "unit"}
+		got := familyColumns["in_flight"].columns
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("in_flight columns = %v, want %v", got, want)
+		}
+	})
 }
 
 // TestLatencyMetricIndexMatchesTokenColumns asserts position parity: the metric
@@ -110,5 +117,50 @@ func TestNonTokenFamiliesHaveNoMetric(t *testing.T) {
 func TestLatencyWhitelisted(t *testing.T) {
 	if !familyWhitelist["latency"] {
 		t.Errorf("familyWhitelist[\"latency\"] = false, want true")
+	}
+}
+
+// TestBackendLanesLayout asserts the backend_lanes family has its own column
+// layout — exactly ts, backend, metric, value, unit — and that the values func
+// wires Row.Backend into the backend slot, Row.MetricName (the SHORT lane
+// name) into the metric slot, with unit "lanes" as the parser default.
+func TestBackendLanesLayout(t *testing.T) {
+	want := []string{"ts", "backend", "metric", "value", "unit"}
+	got := familyColumns["backend_lanes"].columns
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("backend_lanes columns = %v, want %v", got, want)
+	}
+
+	if !familyWhitelist["backend_lanes"] {
+		t.Errorf("familyWhitelist[\"backend_lanes\"] = false, want true")
+	}
+
+	backendIdx := -1
+	for i, c := range got {
+		if c == "backend" {
+			backendIdx = i
+		}
+	}
+	if backendIdx < 0 {
+		t.Fatalf("backend_lanes columns missing \"backend\": %v", got)
+	}
+
+	row := parser.Row{
+		TS:         time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
+		Backend:    "tensorfold",
+		MetricName: "streams_decoding",
+		Value:      4,
+		Unit:       "lanes",
+		Family:     "backend_lanes",
+	}
+	vals := familyColumns["backend_lanes"].values(row)
+	if len(vals) != len(want) {
+		t.Fatalf("len(backend_lanes values) = %d, want %d", len(vals), len(want))
+	}
+	if gotBackend := vals[backendIdx]; gotBackend != row.Backend {
+		t.Errorf("backend_lanes values[%d] = %v, want Backend %q", backendIdx, gotBackend, row.Backend)
+	}
+	if gotMetric := vals[indexOfMetric(got)]; gotMetric != row.MetricName {
+		t.Errorf("backend_lanes values[metric] = %v, want MetricName %q", gotMetric, row.MetricName)
 	}
 }

@@ -54,6 +54,13 @@ const (
 	// statusBackoff marks the health row written when a target scrape is
 	// skipped because the target is still inside its backoff window.
 	statusBackoff = "backoff"
+
+	// inventoryPruneGrace is how long a deployment_inventory row must be
+	// absent from successful /model/info syncs (last_alive quiet) before
+	// PruneDeployments may delete it. Live deployments refresh last_alive on
+	// every upsert (sync cadence is seconds), so the grace only bites rows
+	// that vanished from the roster long ago.
+	inventoryPruneGrace = 24 * time.Hour
 )
 
 func main() {
@@ -108,14 +115,14 @@ func main() {
 
 	runCycle(ctx, tlist, warehouse, fetch, tripwire, tracker, deltaTracker, lastAttempt)
 	for _, t := range tlist {
-		syncInventory(ctx, t, invSync, tracker)
+		syncInventory(ctx, t, invSync, tracker, warehouse)
 	}
 
 	for ctx.Err() == nil {
 		<-ticker.C
 		runCycle(ctx, tlist, warehouse, fetch, tripwire, tracker, deltaTracker, lastAttempt)
 		for _, t := range tlist {
-			syncInventory(ctx, t, invSync, tracker)
+			syncInventory(ctx, t, invSync, tracker, warehouse)
 		}
 	}
 
@@ -228,6 +235,17 @@ func scrapeTarget(ctx context.Context, t targets.Target, w store.Writer, fetch *
 		log.Printf("target %s: cardinality tripwire tripped at %d series — excess dropped, allowed rows written", t.Name, result.SeriesCount)
 	}
 
+	// Backend_lanes rows carry the target's name as their backend identity —
+	// the SAME identity WriteHealth records for this target — so the stored
+	// tensorfold lane gauges are attributable to the scraped endpoint. The
+	// source gauges are unlabeled, so the parser leaves Row.Backend empty for
+	// this family; every other family's Backend stays "" (untouched).
+	for i := range result.Rows {
+		if result.Rows[i].Family == parser.FamilyBackendLanes {
+			result.Rows[i].Backend = t.Name
+		}
+	}
+
 	// Apply per-series delta policy before writing:
 	// counter series are stored as per-interval deltas (first sample skipped,
 	// resets handled by the tracker) and gauge series are stored raw. Rows the
@@ -262,7 +280,9 @@ func scrapeTarget(ctx context.Context, t targets.Target, w store.Writer, fetch *
 // syncInventory polls one target's /model/info via the inventory syncer,
 // applying the same tracker-based backoff used by scrapeTarget (adapted:
 // no lastAttempt map exists here, so a non-zero Wait means still backing off).
-func syncInventory(ctx context.Context, t targets.Target, s *inventory.Syncer, tr *backoff.Tracker) {
+// On success it prunes deployment_inventory rows that vanished from the
+// roster; w must be the same *store.PG the Syncer upserts through.
+func syncInventory(ctx context.Context, t targets.Target, s *inventory.Syncer, tr *backoff.Tracker, w *store.PG) {
 	key := t.Name + ":modelinfo"
 	if d := tr.Wait(key); d > 0 {
 		return
@@ -272,14 +292,28 @@ func syncInventory(ctx context.Context, t targets.Target, s *inventory.Syncer, t
 	if err != nil {
 		// A failed /model/info poll leaves the last-known-good inventory rows
 		// and the in-memory cache untouched; it must never abort or affect the
-		// metrics scrape loop.
+		// metrics scrape loop. No prune runs here either: a failed sync must
+		// keep the last-known-good DB rows exactly as they are.
 		f := tr.RecordFailure(key)
 		log.Printf("target %s: model info sync failed (failure #%d): %v", t.Name, f, err)
 		return
 	}
 	tr.RecordSuccess(key)
-	// Success is intentionally not logged: this fires every 15s per target and
-	// main.go has no verbose flag; INFO here would flood the log.
+
+	// Prune roster rows absent from the just-completed SUCCESSFUL sync and
+	// quiet past the grace. The keep set is the model_id list recorded by the
+	// store during this sync's upsert (LastSyncedModelIDs); the 24h grace
+	// means only rows quiet far longer than any live sync cadence are
+	// removed. Runs strictly on the success path — after the upsert, alongside
+	// the cache refresh — never after a failed poll.
+	pruned, err := w.PruneDeployments(ctx, store.LastSyncedModelIDs(), inventoryPruneGrace)
+	if err != nil {
+		log.Printf("target %s: inventory prune failed: %v", t.Name, err)
+		return
+	}
+	if pruned > 0 {
+		log.Printf("inventory: pruned %d deployment(s) absent from sync for %q", pruned, t.Name)
+	}
 }
 
 // applyDeltas routes every parsed row through the shared delta tracker and

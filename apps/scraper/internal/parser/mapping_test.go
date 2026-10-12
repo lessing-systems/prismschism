@@ -37,25 +37,32 @@ func TestMetricFamilyMap(t *testing.T) {
 		// stored. The proxy/failed request counters advance in lockstep with it
 		// for the same requests, and the requests schema has no metric column,
 		// so SUM(value) per bucket counted every request at least twice.
-		"litellm_requests_metric_total":                             "requests",
-		"litellm_spend_metric_total":                                "spend",
-		"litellm_remaining_tokens_metric":                           "limits",
-		"litellm_remaining_requests_metric":                         "limits",
-		"litellm_remaining_api_key_budget_metric":                   "limits",
-		"litellm_remaining_team_budget_metric":                      "limits",
-		"litellm_remaining_user_budget_metric":                      "limits",
-		"litellm_remaining_org_budget_metric":                       "limits",
-		"litellm_deployment_rpm_limit":                              "limits",
-		"litellm_deployment_tpm_limit":                              "limits",
-		"litellm_remaining_api_key_requests_for_model":              "limits",
-		"litellm_remaining_api_key_tokens_for_model":                "limits",
-		"litellm_api_key_rate_limit_allowed_metric":                 "limits",
-		"litellm_api_key_rate_limit_used_metric":                    "limits",
-		"litellm_team_rate_limit_allowed_metric":                    "limits",
-		"litellm_team_rate_limit_used_metric":                       "limits",
+		"litellm_requests_metric_total":                "requests",
+		"litellm_spend_metric_total":                   "spend",
+		"litellm_remaining_tokens_metric":              "limits",
+		"litellm_remaining_requests_metric":            "limits",
+		"litellm_remaining_api_key_budget_metric":      "limits",
+		"litellm_remaining_team_budget_metric":         "limits",
+		"litellm_remaining_user_budget_metric":         "limits",
+		"litellm_remaining_org_budget_metric":          "limits",
+		"litellm_deployment_rpm_limit":                 "limits",
+		"litellm_deployment_tpm_limit":                 "limits",
+		"litellm_remaining_api_key_requests_for_model": "limits",
+		"litellm_remaining_api_key_tokens_for_model":   "limits",
+		"litellm_api_key_rate_limit_allowed_metric":    "limits",
+		"litellm_api_key_rate_limit_used_metric":       "limits",
+		"litellm_team_rate_limit_allowed_metric":       "limits",
+		"litellm_team_rate_limit_used_metric":          "limits",
 		// Newly landed metrics (previously in the skipped slice).
 		"litellm_deployment_state":             "deployment_health",
 		"litellm_deployment_cooled_down_total": "counters",
+		"litellm_in_flight_requests":           "in_flight",
+		// backend_lanes: the four tensorfold lane gauges (all GAUGES, per the
+		// family's IsCounter=false semantics in buildRow).
+		"tensorfold:requests_running":   "backend_lanes",
+		"tensorfold:requests_waiting":   "backend_lanes",
+		"tensorfold_health:streams":     "backend_lanes",
+		"tensorfold_health:streams_max": "backend_lanes",
 	}
 	for name, wantFamily := range mapped {
 		gotFamily, ok := familyFor(name)
@@ -83,7 +90,6 @@ func TestMetricFamilyMap(t *testing.T) {
 		"litellm_deployment_failure_responses_total",
 		"litellm_cache_hits_metric_total",
 		"litellm_cache_misses_metric_total",
-		"litellm_in_flight_requests",
 		"litellm_guardrail_requests_total",
 		"litellm_guardrail_errors_total",
 		"litellm_team_members_metric",
@@ -384,8 +390,8 @@ func TestParseSampleFile(t *testing.T) {
 	if statuses["halogen-qwen3.8-flash-next"] != "healthy" {
 		t.Errorf("halogen-qwen3.8-flash-next status = %q, want \"healthy\" (gauge 0.0)", statuses["halogen-qwen3.8-flash-next"])
 	}
-	if statuses["orchestration"] != "error" {
-		t.Errorf("orchestration status = %q, want \"error\" (gauge 2.0)", statuses["orchestration"])
+	if statuses["orchestration"] != "prefill" {
+		t.Errorf("orchestration status = %q, want \"prefill\" (gauge 2.0, maintenance)", statuses["orchestration"])
 	}
 }
 
@@ -527,15 +533,19 @@ func TestDeploymentStateCompositeKey(t *testing.T) {
 		t.Errorf("SeriesKey() must not carry a status label: %q", a.SeriesKey())
 	}
 
-	// Caller decision: 0 -> healthy; every non-zero -> error.
+	// Caller decision: 0 -> healthy; 1 (partial) and 2 (maintenance) -> prefill
+	// (no false "error"; the API has no "disabled" state); anything else -> error.
 	if got := valueToStatus(0); got != "healthy" {
 		t.Errorf("valueToStatus(0) = %q, want \"healthy\"", got)
 	}
-	if got := valueToStatus(1); got != "error" {
-		t.Errorf("valueToStatus(1) = %q, want \"error\"", got)
+	if got := valueToStatus(1); got != "prefill" {
+		t.Errorf("valueToStatus(1) = %q, want \"prefill\"", got)
 	}
-	if got := valueToStatus(2); got != "error" {
-		t.Errorf("valueToStatus(2) = %q, want \"error\"", got)
+	if got := valueToStatus(2); got != "prefill" {
+		t.Errorf("valueToStatus(2) = %q, want \"prefill\"", got)
+	}
+	if got := valueToStatus(3); got != "error" {
+		t.Errorf("valueToStatus(3) = %q, want \"error\"", got)
 	}
 }
 
@@ -727,5 +737,61 @@ litellm_requests_metric_total{requested_model="orchestration",route="/v1/chat/co
 	// so it stays empty here even though the label is present on the series.
 	if r.ExceptionStatus != "" {
 		t.Errorf("ExceptionStatus = %q, want empty for the requests family (counters-only label)", r.ExceptionStatus)
+	}
+}
+
+// TestBackendLanesRows verifies the tensorfold lane gauges parse into
+// backend_lanes rows with the SHORT derived lane names (Row.MetricName:
+// "running"/"waiting"/"max"/"streams_"+state), the family's default unit
+// "lanes", and gauge semantics (IsCounter=false — the delta path stores raw
+// readings, never deltas).
+func TestBackendLanesRows(t *testing.T) {
+	input := `
+tensorfold:requests_running 4
+tensorfold:requests_waiting 0
+tensorfold_health:streams{state="decoding"} 4
+tensorfold_health:streams{state="filling"} 0
+tensorfold_health:streams{state="paused"} 0
+tensorfold_health:streams_max 8
+`
+	ts := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	res, err := Parse(input, ts, NewTripwire(10))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(res.Rows) != 6 {
+		t.Fatalf("len(Rows) = %d, want 6 (one per lane-gauge series)", len(res.Rows))
+	}
+
+	want := map[string]float64{
+		"running":          4,
+		"waiting":          0,
+		"streams_decoding": 4,
+		"streams_filling":  0,
+		"streams_paused":   0,
+		"max":              8,
+	}
+	for _, r := range res.Rows {
+		if r.Family != FamilyBackendLanes {
+			t.Errorf("row %q: Family = %q, want %q", r.MetricName, r.Family, FamilyBackendLanes)
+		}
+		if r.IsCounter {
+			t.Errorf("row %q: IsCounter = true, want false (lane gauges are stored raw)", r.MetricName)
+		}
+		if r.Unit != "lanes" {
+			t.Errorf("row %q: Unit = %q, want \"lanes\"", r.MetricName, r.Unit)
+		}
+		wantVal, ok := want[r.MetricName]
+		if !ok {
+			t.Errorf("unexpected lane row MetricName = %q, want one of the derived short names %v", r.MetricName, want)
+			continue
+		}
+		if r.Value != wantVal {
+			t.Errorf("row %q: Value = %v, want %v", r.MetricName, r.Value, wantVal)
+		}
+		delete(want, r.MetricName)
+	}
+	if len(want) != 0 {
+		t.Errorf("missing lane rows for metrics %v", want)
 	}
 }

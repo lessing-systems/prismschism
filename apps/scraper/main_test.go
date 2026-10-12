@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -282,5 +284,120 @@ func TestScrapeTargetBackoffWritesHealthRow(t *testing.T) {
 	}
 	if h.HealthValue != 0 {
 		t.Errorf("HealthValue = %v, want 0", h.HealthValue)
+	}
+}
+
+// backendLanesBody is a minimal tensorfold-style exposition: the four
+// backend_lanes lane gauges (untyped source series) plus one litellm gauge and
+// one litellm counter, so the test can assert BOTH the stamped and the
+// untouched Backend field after the scrape.
+const backendLanesBody = `
+tensorfold:requests_running 4
+tensorfold:requests_waiting 0
+tensorfold_health:streams{state="decoding"} 4
+tensorfold_health:streams{state="filling"} 0
+tensorfold_health:streams{state="paused"} 0
+tensorfold_health:streams_max 8
+# TYPE litellm_in_flight_requests gauge
+litellm_in_flight_requests 7
+# TYPE litellm_requests_metric_total counter
+litellm_requests_metric_total{api_provider="openai",hashed_api_key="hk-1",model="gpt-4"} 10
+`
+
+// TestScrapeTargetStampsBackendLanesBackend proves the backend_lanes stamping
+// seam (scrapeTarget, after Parse and before applyDeltas): rows of the
+// backend_lanes family end with Backend == the target name — the SAME identity
+// WriteHealth records — while every other family's Backend stays "".
+//
+// The seam is a raw-body scrape of the target's URL, so the test drives it
+// end-to-end through an httptest server (no network leaves the process; the
+// 127.0.0.1 listener is loopback-only). The requests counter is seeded on the
+// first cycle (first-sample baseline skip) and only surfaces as a stored delta
+// row on the second cycle, which is when its Backend is asserted.
+func TestScrapeTargetStampsBackendLanesBackend(t *testing.T) {
+	body := backendLanesBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	wh := &store.Fake{}
+	fetch := fetcher.New(fetcher.DefaultTimeout)
+	tw := parser.NewTripwire(10)
+	tracker := backoff.NewTracker(backoff.DefaultPolicy())
+	deltaTracker := delta.NewTracker()
+	lastAttempt := make(map[string]time.Time)
+
+	target := targets.Target{
+		Name:   "tensorfold",
+		URL:    srv.URL + "/metrics",
+		APIKey: "test-key",
+	}
+
+	// Cycle 1: baseline — counters skipped, gauges kept.
+	scrapeTarget(context.Background(), target, wh, fetch, tw, tracker, deltaTracker, lastAttempt)
+
+	var lanes, others []parser.Row
+	for _, r := range wh.Metrics {
+		if r.Family == parser.FamilyBackendLanes {
+			lanes = append(lanes, r)
+		} else {
+			others = append(others, r)
+		}
+	}
+	if len(lanes) != 6 {
+		t.Fatalf("cycle 1: %d backend_lanes rows, want 6", len(lanes))
+	}
+	for _, r := range lanes {
+		if r.Backend != "tensorfold" {
+			t.Errorf("cycle 1: backend_lanes row %q Backend = %q, want \"tensorfold\" (target name)", r.MetricName, r.Backend)
+		}
+	}
+	if len(others) != 1 {
+		t.Fatalf("cycle 1: %d non-backend_lanes rows, want 1 (the in_flight gauge)", len(others))
+	}
+	if others[0].Backend != "" {
+		t.Errorf("cycle 1: in_flight row Backend = %q, want \"\" (stamping is backend_lanes-only)", others[0].Backend)
+	}
+
+	// Cycle 2: the requests counter advances 10 -> 13 and is now stored as a
+	// delta row — with Backend still untouched (""), unlike the lane gauges.
+	body = `
+tensorfold:requests_running 4
+tensorfold:requests_waiting 0
+tensorfold_health:streams{state="decoding"} 4
+tensorfold_health:streams{state="filling"} 0
+tensorfold_health:streams{state="paused"} 0
+tensorfold_health:streams_max 8
+# TYPE litellm_in_flight_requests gauge
+litellm_in_flight_requests 7
+# TYPE litellm_requests_metric_total counter
+litellm_requests_metric_total{api_provider="openai",hashed_api_key="hk-1",model="gpt-4"} 13
+`
+	wh.Metrics = nil
+	scrapeTarget(context.Background(), target, wh, fetch, tw, tracker, deltaTracker, lastAttempt)
+
+	var reqDelta *parser.Row
+	for i := range wh.Metrics {
+		if wh.Metrics[i].Family == "requests" {
+			reqDelta = &wh.Metrics[i]
+			break
+		}
+	}
+	if reqDelta == nil {
+		t.Fatalf("cycle 2: no requests delta row stored; rows = %+v", wh.Metrics)
+	}
+	if reqDelta.Value != 3 {
+		t.Errorf("cycle 2: requests delta = %v, want 3 (13-10)", reqDelta.Value)
+	}
+	if reqDelta.Backend != "" {
+		t.Errorf("cycle 2: requests delta row Backend = %q, want \"\"", reqDelta.Backend)
+	}
+
+	// The stamped identity matches the one WriteHealth records for the target.
+	for _, h := range wh.Health {
+		if h.Backend != "tensorfold" {
+			t.Errorf("health row Backend = %q, want \"tensorfold\"", h.Backend)
+		}
 	}
 }
