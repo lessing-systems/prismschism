@@ -4,8 +4,46 @@ import { RangeToggle, RANGES } from '@/components/RangeToggle';
 import { LiveStatus } from '@/components/LiveStatus';
 import { FleetMetricsPanel } from '@/components/FleetMetricsPanel';
 import { InFlightCard } from '@/components/InFlightCard';
+import { ErrorsPage } from '@/components/ErrorsPage';
 import { VendorCredit } from '@/components/VendorCredit';
+import { cn } from '@/lib/utils';
 import type { Range } from '@/lib/types';
+
+type Tab = 'live' | 'errors';
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'live', label: 'Live' },
+  { id: 'errors', label: 'Errors' },
+];
+
+// Lightweight tab switcher (no router dependency): same pill vocabulary as
+// RangeToggle. "Live" is the pre-existing dashboard; "Errors" is the
+// unified error history.
+function TabSwitcher({ value, onChange }: { value: Tab; onChange: (t: Tab) => void }) {
+  return (
+    <div role="tablist" aria-label="View" className="flex items-center rounded-full border border-border bg-card/80 p-1 text-xs font-medium">
+      {TABS.map((t) => {
+        const active = value === t.id;
+        return (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(t.id)}
+            className={cn(
+              'rounded-full px-3 py-1 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+              active
+                ? 'bg-primary text-primary-foreground shadow-sm'
+                : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {t.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 const RANGE_KEY = 'prismschism:range';
 
@@ -33,6 +71,7 @@ function LogoMark() {
 
 function App() {
   const [range, setRange] = useState<Range>(readRange);
+  const [tab, setTab] = useState<Tab>('live');
   useEffect(() => {
     try {
       localStorage.setItem(RANGE_KEY, range);
@@ -55,6 +94,7 @@ function App() {
           </div>
           <div className="ml-auto flex flex-wrap items-center gap-2 sm:gap-3">
             <LiveStatus />
+            <TabSwitcher value={tab} onChange={setTab} />
             <RangeToggle value={range} onChange={setRange} />
             <ThemeToggle />
           </div>
@@ -62,10 +102,16 @@ function App() {
       </header>
 
       <main className="mx-auto max-w-[2400px] px-4 pb-16 pt-6 sm:px-6 lg:px-10">
-        <div className="mb-6">
-          <InFlightCard />
-        </div>
-        <FleetMetricsPanel range={range} />
+        {tab === 'live' ? (
+          <>
+            <div className="mb-6">
+              <InFlightCard />
+            </div>
+            <FleetMetricsPanel range={range} />
+          </>
+        ) : (
+          <ErrorsPage />
+        )}
       </main>
     </div>
   );
