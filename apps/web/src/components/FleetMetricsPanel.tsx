@@ -148,6 +148,23 @@ function withInventory(
   return [...ranked, ...extra];
 }
 
+// Metric-only ghost groups must never surface as back-end cards. The fleet sums
+// ghost-proof themselves via rosteredVisible, but card EXISTENCE needs the same
+// predicate: a group whose points are all `in_inventory: false` exists only in
+// metrics (retired model_ids, LiteLLM aliases, scrape artifacts — live DB saw
+// literal 'None' and '' bursts) and has no deployment_inventory row to vouch for
+// it. Runs AFTER withUnassigned so the debug-only "unassigned" pin (a sentinel,
+// not a ghost name) survives, and BEFORE swatchGroups is derived so the swatch
+// order is derived from the exact filtered render list — one source of truth.
+// Rostered-but-dead deployments (in_inventory true, zeros) still render: that is
+// the roster spine; the scraper prune removes truly-removed ones.
+function dropGhostGroups(groups: TopGroup[], points: MetricPoint[]): TopGroup[] {
+  const rostered = new Set(
+    points.filter((p) => p.in_inventory !== false).map((p) => p.group),
+  );
+  return groups.filter((g) => g.group === UNASSIGNED_GROUP || rostered.has(g.group));
+}
+
 // Debug-only: pin the "unassigned" card to the end of the list so it is visible
 // whenever the flag is on, even at zero traffic and even outside the top-N cut.
 function withUnassigned(groups: TopGroup[], points: MetricPoint[]): TopGroup[] {
@@ -716,13 +733,18 @@ export function FleetMetricsPanel({ range = "1h" }: { range?: Range }) {
   // UNKNOWN_DEPLOYMENT) and can never read "unlabeled". Ranking is decode-driven
   // (see the back-end card note above), then re-widened so inventory-backed
   // backends are never dropped by the top-N cut, and — only while the debug flag is
-  // on — the always-emitted "unassigned" group gets its card pinned at the end.
+  // on — the always-emitted "unassigned" group gets its card pinned at the end,
+  // and metric-only ghost groups (in_inventory false) are dropped before the
+  // list reaches the card grid or the swatch derivation below.
   const deploymentPoints = visibleSeries(decodeByDeployment.data);
-  const deploymentGroups = withUnassigned(
-    withInventory(
-      topOf(decodeByDeployment, deploymentLabel),
+  const deploymentGroups = dropGhostGroups(
+    withUnassigned(
+      withInventory(
+        topOf(decodeByDeployment, deploymentLabel),
+        deploymentPoints,
+        deploymentLabel,
+      ),
       deploymentPoints,
-      deploymentLabel,
     ),
     deploymentPoints,
   );

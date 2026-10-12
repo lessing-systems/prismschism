@@ -154,6 +154,10 @@ interface DeploymentFixture {
   modelId: string;
   name?: string;
   total: number;
+  // When set, stamped onto every point of the fixture. Undefined mirrors the
+  // API's "no inventory column" shape (kept by the rostered predicates);
+  // false marks a metric-only ghost the card grid must drop.
+  inInventory?: boolean;
 }
 
 function makeDeploymentSeries(fixtures: DeploymentFixture[]): MP[] {
@@ -166,6 +170,9 @@ function makeDeploymentSeries(fixtures: DeploymentFixture[]): MP[] {
     ];
     if (f.name !== undefined) {
       for (const p of points) p.litellm_model_name = f.name;
+    }
+    if (f.inInventory !== undefined) {
+      for (const p of points) p.in_inventory = f.inInventory;
     }
     out.push(...points);
   }
@@ -632,5 +639,50 @@ describe('FleetMetricsPanel — fleet combined token/s', () => {
     const el = screen.getByTestId('fleet-combined-tps');
     expect(el.textContent).toContain('\u2014');
     expect(el.textContent).not.toContain('0');
+  });
+});
+
+describe('FleetMetricsPanel — metric-only ghost groups', () => {
+  it('renders no card (and no legend swatch) for a metric-only ghost deployment while rostered groups still render', () => {
+    // 'None' and '' are the literal model_id bursts the live DB produced for
+    // unresolved label sets; both carry in_inventory: false (metric-only, no
+    // deployment_inventory row). The rostered deployment is in_inventory: true.
+    setDeployments({
+      isLoading: false,
+      isError: false,
+      data: makeDeploymentSeries([
+        { modelId: 'rostered-real', name: 'real-model', total: 400, inInventory: true },
+        { modelId: 'None', total: 250, inInventory: false },
+        { modelId: '', name: 'orphaned-name', total: 120, inInventory: false },
+      ]),
+    });
+    render(<FleetMetricsPanel />);
+
+    const cards = screen.getAllByTestId('deployment-card').map((c) => c.textContent ?? '');
+    expect(cards.some((t) => t.includes('rostered-real'))).toBe(true);
+    expect(cards.some((t) => t.includes('None'))).toBe(false);
+    expect(cards.some((t) => t.includes('unknown-deployment'))).toBe(false);
+
+    // swatchGroups is derived from the same filtered list: no ghost swatches.
+    const legend = screen.getByTestId('fleet-legend').textContent ?? '';
+    expect(legend).not.toContain('None');
+    expect(legend).not.toContain('unknown-deployment');
+  });
+
+  it('still renders a rostered-but-dead deployment (in_inventory true, zeros) as a card at 0', () => {
+    setDeployments({
+      isLoading: false,
+      isError: false,
+      data: makeDeploymentSeries([
+        { modelId: 'rostered-real', name: 'real-model', total: 400, inInventory: true },
+        { modelId: 'rostered-dead', name: 'dead-model', total: 0, inInventory: true },
+        { modelId: 'None', total: 250, inInventory: false },
+      ]),
+    });
+    render(<FleetMetricsPanel />);
+
+    const cards = screen.getAllByTestId('deployment-card').map((c) => c.textContent ?? '');
+    expect(cards.some((t) => t.includes('rostered-dead'))).toBe(true);
+    expect(cards.some((t) => t.includes('None'))).toBe(false);
   });
 });
