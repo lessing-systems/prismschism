@@ -160,4 +160,4 @@ done
 
 # --- 5. Summary ----------------------------------------------------------------
 
-log "Done. Applied this run: $applied. Skipped (already in ledger): $skipped. Pending: $pending."
+log "Done. Applied this run: $applied. Skipped (already in ledger): $skipped."
